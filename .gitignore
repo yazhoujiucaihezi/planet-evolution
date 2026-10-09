@@ -1,0 +1,14 @@
+# 构建产物
+target/
+logs/
+
+# 启动脚本里的敏感信息
+start-backend.ps1
+
+# IDE
+.idea/
+*.iml
+
+# 系统
+.DS_Store
+Thumbs.db

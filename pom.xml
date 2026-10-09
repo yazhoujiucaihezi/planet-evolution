@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.5.8</version>
+    <relativePath/>
+  </parent>
+
+  <groupId>com.planet</groupId>
+  <artifactId>planet-evolution</artifactId>
+  <version>0.0.1-SNAPSHOT</version>
+  <name>planet-evolution</name>
+  <description>星球演化模拟器</description>
+
+  <properties>
+    <java.version>17</java.version>
+    <!-- 源码是 UTF-8；不显式指定时 Maven 会按平台编码(GBK)读取，导致中文字符串乱码 -->
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- 本机 .m2 里 starter-parent 默认的 3.14.1 编译插件依赖 jar 缺失，
+           固定为本地依赖齐全的 3.10.1，保证离线构建。 -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.10.1</version>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+      </plugin>
+      <!-- 注意：spring-boot-maven-plugin:3.5.8 的依赖 spring-boot-loader-tools:3.5.8
+           在本机 .m2 中只有 .pom、没有 .jar，离线无法执行 repackage，
+           因此暂不引入该插件；启动方式见 run.ps1。 -->
+    </plugins>
+  </build>
+</project>
