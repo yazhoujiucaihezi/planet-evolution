@@ -3,6 +3,7 @@ package com.planet.evolution.config;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
+import com.planet.evolution.model.Civilization;
 import com.planet.evolution.model.Planet;
 import com.planet.evolution.model.World;
 import com.planet.evolution.simulation.EarthLikeProfile;
@@ -24,7 +25,9 @@ public class WorldConfig {
     @Bean
     public World world() {
         World world = new World(new Planet("盖亚", 15.0, 1.0));
-        world.spawnCivilization("人类");
+        // 开局第一个文明固定是玩家（id=1）：点亮它的领土和一圈接壤区域，其余留在黑雾里
+        Civilization player = world.spawnCivilization("人类");
+        world.exploreAround(player);
         return world;
     }
 

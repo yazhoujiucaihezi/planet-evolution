@@ -17,6 +17,9 @@ body {
   color: var(--text);
   font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
   font-size: 14px;
+  /* 新布局：主区域 + 右下角小地图 */
+  position: relative;
+  min-height: 100vh;
 }
 
 header {
@@ -32,6 +35,12 @@ h1 { margin: 0; font-size: 22px; }
 h2 { margin: 0 0 10px; font-size: 16px; color: var(--accent); }
 .year { font-size: 16px; color: var(--muted); }
 .year span { color: var(--text); font-weight: 700; }
+
+/* ==================== 主区域布局 ==================== */
+.main-area {
+  margin: 0;
+  padding-bottom: 160px; /* 留出小地图的空间 */
+}
 
 .panel {
   background: var(--panel);
@@ -79,11 +88,6 @@ button {
 button:hover { border-color: var(--accent); }
 button:disabled { opacity: .5; cursor: default; }
 
-table { width: 100%; border-collapse: collapse; }
-th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
-th { color: var(--muted); font-weight: 500; font-size: 12px; }
-tr.dead td { color: #6d7893; }
-
 ul { list-style: none; margin: 0; padding: 0; max-height: 340px; overflow-y: auto; }
 li.event {
   padding: 7px 10px;
@@ -99,6 +103,37 @@ li.event .empty { color: var(--muted); }
 
 .badge { color: var(--muted); font-size: 12px; font-weight: 400; }
 .note { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+
+/* 王国四柱 */
+.pillars { display: grid; gap: 8px; }
+.pillar {
+  display: grid;
+  grid-template-columns: 52px 1fr 40px;
+  align-items: center;
+  gap: 10px;
+}
+.pillar-name { color: var(--muted); font-size: 12px; }
+.pillar-track {
+  height: 14px;
+  background: #0d1428;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  overflow: hidden;
+}
+.pillar-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 7px;
+  transition: width .3s ease, background-color .3s ease;
+}
+.pillar-fill.danger { background: #ff4d4f; }
+.pillar-fill.warn { background: #ffd166; }
+.pillar-fill.ok { background: #4ade80; }
+.pillar-value {
+  text-align: right;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
 .error {
   margin: 12px 0 0;
   padding: 10px 12px;
@@ -106,4 +141,282 @@ li.event .empty { color: var(--muted); }
   background: #2a1420;
   color: #ffb3c1;
   border-radius: 6px;
+}
+
+/* ==================== 小地图（右下角固定） ==================== */
+.mini-map-container {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  width: 200px;
+  height: 120px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  cursor: pointer;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+.mini-map-container:hover {
+  border-color: var(--accent);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+}
+#miniMap {
+  width: 100%;
+  height: 100%;
+  background: #141a26;
+  border-radius: 6px;
+}
+#miniMap path,
+#miniMap g > path {
+  stroke: #0b1020;
+  stroke-width: 0.4;
+}
+.mini-map-hint {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  margin: 0;
+  padding: 4px;
+  background: rgba(11, 16, 32, 0.85);
+  text-align: center;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+/* ==================== 弹出全屏地图遮罩 ==================== */
+.map-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(4, 7, 16, 0.92);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+.map-overlay[hidden] { display: none; }
+
+.map-container {
+  width: 90vw;
+  height: 75vh;
+  background: #141a26;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+#bigMap {
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+}
+#bigMap:active {
+  cursor: grabbing;
+}
+#bigMap path,
+#bigMap g > path {
+  stroke: #0b1020;
+  stroke-width: 0.5;
+  transition: fill .3s ease;
+}
+/* 可点击区域悬停效果 */
+#bigMap path.clickable:hover,
+#bigMap g.clickable > path {
+  opacity: 0.85;
+  cursor: pointer;
+}
+
+/* 地图控制按钮 */
+.map-controls {
+  display: flex;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+/* 区域详情面板 */
+.region-detail {
+  position: fixed;
+  right: 20px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 280px;
+  max-height: 70vh;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px;
+  overflow-y: auto;
+}
+.region-detail[hidden] { display: none; }
+.region-detail h3 {
+  margin: 0 0 12px;
+  font-size: 18px;
+  color: var(--text);
+}
+.region-owner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.civ-color {
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+}
+.civ-stats {
+  background: #111730;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+.civ-stats p {
+  margin: 4px 0;
+  display: flex;
+  justify-content: space-between;
+}
+.civ-stats span { font-weight: 600; }
+.neighbors-section h4,
+.events-section h4 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.neighbors-section ul {
+  max-height: 120px;
+  margin-bottom: 12px;
+}
+.neighbors-section li {
+  padding: 4px 8px;
+  background: #111730;
+  border-radius: 4px;
+  margin-bottom: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.neighbors-section li:hover {
+  background: #1a2238;
+  color: var(--accent);
+}
+.events-section ul {
+  max-height: 200px;
+}
+.events-section li {
+  padding: 6px 8px;
+  border-left: 2px solid var(--line);
+  margin-bottom: 4px;
+  background: #111730;
+  border-radius: 4px;
+  font-size: 11px;
+}
+.events-section li .year {
+  color: var(--muted);
+  font-size: 10px;
+}
+.events-section li .type {
+  color: var(--accent);
+  font-size: 10px;
+}
+.events-section li .desc {
+  display: block;
+  margin-top: 2px;
+}
+
+/* ==================== 科技树面板 ==================== */
+.tech-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(4, 7, 16, .82);
+}
+.tech-overlay[hidden] { display: none; }
+
+.tech-dialog {
+  width: min(1040px, 100%);
+  max-height: 100%;
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px 18px;
+}
+.tech-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.tech-head h2 { margin: 0; }
+
+.tech-branches {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 12px;
+}
+.tech-branch {
+  background: #111730;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+}
+.tech-branch h3 {
+  margin: 0 0 8px;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.tech-nodes { display: flex; flex-direction: column; }
+
+.tech-node {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 2px solid var(--line);
+  border-radius: 8px;
+  background: #0d1428;
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+}
+.tech-node .tech-cost {
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.tech-node .tech-lock { margin-right: 4px; }
+.tech-node.unlocked { border-color: #4ade80; background: #10251a; }
+.tech-node.researching { border-color: #ffd166; background: #2a2410; }
+.tech-node.available { border-color: #6b7ba8; background: #16203c; }
+.tech-node.locked { border-color: #2b3450; background: #0b1020; color: #6d7893; }
+.tech-node.unlocked:hover { border-color: #4ade80; }
+.tech-node.researching:hover { border-color: #ffd166; }
+.tech-node.available:hover { border-color: #8fa3d8; }
+.tech-node.locked:hover { border-color: #2b3450; }
+
+.tech-link {
+  width: 2px;
+  height: 16px;
+  margin: 0 auto;
+  background: #2b3450;
+}
+.tech-link.unlocked { background: #4ade80; }
+.tech-link.researching { background: #ffd166; }
+.tech-link.available { background: #6b7ba8; }
+
+/* 高亮玩家区域时的脉冲动画 */
+@keyframes pulse-highlight {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+.highlight-pulse {
+  animation: pulse-highlight 1.5s ease-in-out infinite;
 }

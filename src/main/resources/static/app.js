@@ -1,9 +1,8 @@
-// 星球演化 · 前端逻辑（第一阶段：真实 API 数据展示与手动推进）
+// 星球演化 · 前端逻辑（重构版：主信息区 + 小地图 + 弹出全屏地图）
 const MAJOR_THRESHOLD = 60;
 const MAX_EVENTS_SHOWN = 200;
 const BATCH_YEARS = 200;
 const AUTO_REFRESH_INTERVAL_MS = 1000;
-// 推进结束后，用一轮密集刷新把异步生成的 AI 叙事尽快拉下来
 const NARRATIVE_POLL_INTERVAL_MS = 1000;
 const NARRATIVE_POLL_TIMES = 5;
 const RARITY_LABELS = {
@@ -24,7 +23,6 @@ function showError(message) {
   box.hidden = !message;
 }
 
-// 轻量提示：复用底部提示条，2 秒后自动消失
 let noticeTimer = null;
 
 function showNotice(message, durationMs = 2000) {
@@ -68,49 +66,192 @@ function renderWorld(state) {
   $('year').textContent = num(world.year);
   $('population').textContent = num(world.population);
   $('techTotal').textContent = num(world.techTotal);
-  $('food').textContent = num(Math.round(world.food));
-  $('resources').textContent = num(Math.round(world.resources));
-  $('temperature').textContent = decimal(world.temperature) + ' °C';
-  $('habitability').textContent = decimal(world.habitability);
   $('era').textContent = world.era || '-';
-  $('clock').textContent = (state.paused ? '暂停' : '运行中') + `（速度 ${state.speed}，仅状态）`;
-  renderCivilizations(state.civilizations, world.aliveCivilizations, world.extinctCivilizations);
+  // 四柱简述
+  const pillars = state.pillars;
+  if (pillars) {
+    $('pillars-summary').textContent =
+      `科技${Math.round(pillars.science)} 民生${Math.round(pillars.welfare)} 资源${Math.round(pillars.resource)} 军力${Math.round(pillars.military)}`;
+  } else {
+    $('pillars-summary').textContent = '-';
+  }
+  renderPillars(state.pillars);
 }
 
-function renderCivilizations(civilizations, aliveCivilizations, extinctCivilizations) {
-  const tbody = $('civilizations').querySelector('tbody');
-  tbody.innerHTML = '';
-  const list = Array.isArray(civilizations) ? civilizations.filter(Boolean) : [];
-  // 只显示存活文明（population > 0），灭亡文明不出现在列表中
-  const aliveList = list.filter((c) => c.population > 0);
-  if (aliveList.length === 0) {
-    const emptyRow = document.createElement('tr');
-    emptyRow.innerHTML = '<td colspan="5">暂无存活文明</td>';
-    tbody.appendChild(emptyRow);
+// 王国四柱
+const PILLAR_KEYS = ['science', 'welfare', 'resource', 'military'];
+
+function pillarLevel(value) {
+  if (value <= 20 || value >= 80) return 'danger';
+  if (value < 40 || value > 60) return 'warn';
+  return 'ok';
+}
+
+function renderPillars(pillars) {
+  for (const key of PILLAR_KEYS) {
+    const cap = key.charAt(0).toUpperCase() + key.slice(1);
+    const fill = $('pillar' + cap);
+    const valueBox = $('pillar' + cap + 'Value');
+    if (!fill || !valueBox) {
+      continue;
+    }
+    if (!pillars || typeof pillars[key] !== 'number') {
+      fill.className = 'pillar-fill';
+      fill.style.width = '0%';
+      valueBox.textContent = '-';
+      continue;
+    }
+    const value = Math.max(0, Math.min(100, Math.round(pillars[key])));
+    fill.className = 'pillar-fill ' + pillarLevel(value);
+    fill.style.width = value + '%';
+    valueBox.textContent = String(value);
   }
-  for (const c of aliveList) {
-    const row = document.createElement('tr');
-    row.innerHTML =
-      `<td>${c.name}</td><td>${c.foundedYear}</td>` +
-      `<td>${num(c.population)}</td>` +
-      `<td>${c.techLevel}</td>` +
-      `<td>存活</td>`;
-    tbody.appendChild(row);
+}
+
+// ==================== 科技树面板 ====================
+
+const TECH_BRANCH_IDS = {
+  military: 'techBranchMilitary',
+  economy: 'techBranchEconomy',
+  society: 'techBranchSociety',
+  space: 'techBranchSpace',
+};
+const TECH_STATE_LABELS = {
+  unlocked: '已解锁',
+  researching: '正在研究',
+  available: '可研究',
+  locked: '锁住（需要先解锁前置）',
+};
+
+let techTreeCache = null;
+
+function techNodeState(node, unlockedIds) {
+  if (node.unlocked) return 'unlocked';
+  if (node.researching) return 'researching';
+  const prerequisite = node.prerequisite;
+  return !prerequisite || unlockedIds.has(prerequisite) ? 'available' : 'locked';
+}
+
+function techNodeNames(branches) {
+  const names = new Map();
+  for (const nodes of Object.values(branches || {})) {
+    for (const node of nodes || []) {
+      names.set(node.id, node.name);
+    }
   }
-  // 优先使用后端计数，未提供时按列表回退统计
-  const aliveFromList = aliveList.length;
-  const alive = Number.isFinite(aliveCivilizations) ? aliveCivilizations : aliveFromList;
-  const extinct = Number.isFinite(extinctCivilizations)
-    ? extinctCivilizations
-    : list.length - aliveFromList;
-  $('civCount').textContent = `存活 ${alive} / 累计 ${alive + extinct}`;
+  return names;
+}
+
+function techTooltip(node, unlockedIds, names) {
+  const state = techNodeState(node, unlockedIds);
+  const prerequisiteName = node.prerequisite
+    ? (names.get(node.prerequisite) || node.prerequisite)
+    : '无（分支起点）';
+  return [
+    node.name,
+    `成本：${node.cost}`,
+    `前置：${prerequisiteName}`,
+    `状态：${TECH_STATE_LABELS[state] || state}`,
+  ].join('\n');
+}
+
+function renderTechTree(tree) {
+  const branches = (tree && tree.branches) || {};
+  const unlockedIds = new Set((tree && tree.playerUnlocked) || []);
+  const names = techNodeNames(branches);
+
+  for (const [branchKey, containerId] of Object.entries(TECH_BRANCH_IDS)) {
+    const container = $(containerId);
+    if (!container) continue;
+    container.innerHTML = '';
+    const nodes = branches[branchKey] || [];
+    if (nodes.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'note';
+      empty.textContent = '暂无数据';
+      container.appendChild(empty);
+      continue;
+    }
+    nodes.forEach((node, index) => {
+      const state = techNodeState(node, unlockedIds);
+      if (index > 0) {
+        const link = document.createElement('div');
+        link.className = 'tech-link ' + state;
+        container.appendChild(link);
+      }
+      const el = document.createElement('button');
+      el.type = 'button';
+      el.className = 'tech-node ' + state;
+      el.dataset.techId = node.id;
+      el.title = techTooltip(node, unlockedIds, names);
+      const lock = state === 'locked' ? '<span class="tech-lock">🔒</span>' : '';
+      el.innerHTML = `${lock}<span class="tech-name">${node.name}</span>` +
+        `<span class="tech-cost">${node.cost}</span>`;
+      el.addEventListener('click', () => onTechNodeClick(node, unlockedIds, names));
+      container.appendChild(el);
+    });
+  }
+
+  const unlockedCount = (tree && tree.playerUnlocked ? tree.playerUnlocked.length : 0);
+  const totalCount = Object.values(branches).reduce((sum, nodes) => sum + (nodes ? nodes.length : 0), 0);
+  const researchingId = tree && tree.playerResearching;
+  const researchingName = researchingId ? (names.get(researchingId) || researchingId) : '无';
+  $('techSummary').textContent =
+    `已解锁 ${unlockedCount}/${totalCount} · 正在研究：${researchingName}`;
+}
+
+async function openTechTree() {
+  $('techPanel').hidden = false;
+  await loadTechTree();
+}
+
+function closeTechTree() {
+  $('techPanel').hidden = true;
+}
+
+async function loadTechTree() {
+  try {
+    const tree = await api('/api/world/tech-tree');
+    techTreeCache = tree;
+    renderTechTree(tree);
+  } catch (error) {
+    showError('科技树加载失败：' + error.message);
+  }
+}
+
+async function onTechNodeClick(node, unlockedIds, names) {
+  const state = techNodeState(node, unlockedIds);
+  if (state === 'unlocked') {
+    showNotice(`【${node.name}】已解锁`);
+    return;
+  }
+  if (state === 'locked') {
+    const prerequisiteName = node.prerequisite
+      ? (names.get(node.prerequisite) || node.prerequisite)
+      : '前置';
+    showNotice(`需要先解锁【${prerequisiteName}】`, 4000);
+    return;
+  }
+  if (state === 'researching') {
+    showNotice(`正在研究【${node.name}】`, 3000);
+    return;
+  }
+  if (!confirm(`开始研究【${node.name}】？`)) return;
+  try {
+    const result = await post('/api/command', { text: `研究${node.name}` });
+    const message = result && result.result ? result.result : '指令失败：' + ((result && result.error) || '未知错误');
+    $('commandResult').textContent = message;
+    showNotice(message, 6000);
+  } catch (error) {
+    showError('研究指令发送失败：' + error.message);
+  }
+  await loadTechTree();
+  await refresh().catch(() => {});
 }
 
 function renderEvents(events) {
   const list = $('events');
   list.innerHTML = '';
-  // 空值防御：非数组按空数组处理，过滤 null / undefined
-  // 保留重大事件（稀有度 >= 60）与 AI 叙事事件
   const items = (Array.isArray(events) ? events : [])
     .filter(Boolean)
     .filter((e) => e.rarity >= MAJOR_THRESHOLD || e.type === 'AI_NARRATIVE');
@@ -137,137 +278,390 @@ function renderEvents(events) {
   }
 }
 
-// 7 大洲轮廓（纯手写 SVG 坐标，示意用，不精确）：points 为 "x,y x,y ..."
-const MAP_CONTINENTS = [
-  { name: '北美洲', points: '60,90 150,55 250,55 290,95 280,170 240,205 215,250 185,235 165,195 120,180 70,140' },
-  { name: '南美洲', points: '195,265 290,258 320,300 300,360 275,420 240,450 210,420 190,360 178,310' },
-  { name: '欧洲',   points: '445,160 455,100 495,70 550,58 605,70 640,100 630,150 595,182 535,192 480,185 460,172' },
-  { name: '非洲',   points: '450,208 545,200 615,210 640,240 620,290 590,340 555,385 515,400 480,380 462,330 445,270' },
-  { name: '亚洲',   points: '628,100 655,62 730,40 830,40 915,62 958,110 952,175 935,235 930,275 900,310 860,330 820,318 780,298 750,255 700,236 668,250 648,214 638,152' },
-  { name: '大洋洲', points: '765,330 830,300 910,308 950,345 948,382 920,420 850,432 790,420 762,382' },
-  { name: '南极洲', points: '200,455 700,455 720,478 660,492 300,492 210,478' }
-];
+// ==================== 世界地图（重构版：小地图 + 弹出大地图） ====================
 
-// 30 个区域的色块坐标：摆放位置对应所属大洲（x/y 左上角，w/h 尺寸）
-const MAP_REGIONS = [
-  // 亚洲
-  { id: 6,  name: '北亚',       x: 680, y: 50,  w: 170, h: 45 },
-  { id: 1,  name: '东亚',       x: 868, y: 95,  w: 78,  h: 70 },
-  { id: 2,  name: '东南亚',     x: 858, y: 240, w: 70,  h: 45 },
-  { id: 3,  name: '南亚',       x: 788, y: 196, w: 64,  h: 60 },
-  { id: 4,  name: '中亚',       x: 700, y: 132, w: 85,  h: 55 },
-  { id: 5,  name: '西亚',       x: 660, y: 189, w: 60,  h: 48 },
-  // 欧洲
-  { id: 11, name: '北欧',       x: 535, y: 62,  w: 60,  h: 45 },
-  { id: 7,  name: '西欧',       x: 452, y: 105, w: 62,  h: 45 },
-  { id: 10, name: '中欧',       x: 535, y: 112, w: 60,  h: 42 },
-  { id: 9,  name: '东欧',       x: 598, y: 108, w: 42,  h: 52 },
-  { id: 8,  name: '南欧',       x: 505, y: 160, w: 70,  h: 28 },
-  // 非洲
-  { id: 12, name: '北非',       x: 458, y: 208, w: 150, h: 48 },
-  { id: 13, name: '西非',       x: 455, y: 262, w: 72,  h: 58 },
-  { id: 14, name: '中非',       x: 528, y: 262, w: 60,  h: 58 },
-  { id: 15, name: '东非',       x: 590, y: 258, w: 45,  h: 72 },
-  { id: 16, name: '南非',       x: 528, y: 328, w: 62,  h: 52 },
-  // 南美洲
-  { id: 21, name: '南美北部',   x: 205, y: 265, w: 85,  h: 55 },
-  { id: 22, name: '南美西部',   x: 200, y: 325, w: 50,  h: 80 },
-  { id: 23, name: '南美东部',   x: 258, y: 320, w: 55,  h: 75 },
-  { id: 24, name: '南美南部',   x: 225, y: 405, w: 55,  h: 35 },
-  // 北美洲
-  { id: 18, name: '北美西部',   x: 70,  y: 95,  w: 90,  h: 80 },
-  { id: 17, name: '北美东部',   x: 175, y: 85,  w: 100, h: 85 },
-  { id: 19, name: '中美',       x: 165, y: 200, w: 65,  h: 45 },
-  { id: 20, name: '加勒比',     x: 235, y: 205, w: 50,  h: 35 },
-  // 大洋洲
-  { id: 25, name: '澳大利亚',   x: 790, y: 345, w: 95,  h: 65 },
-  { id: 26, name: '新西兰',     x: 890, y: 385, w: 40,  h: 30 },
-  { id: 27, name: '太平洋岛屿', x: 840, y: 310, w: 70,  h: 34 },
-  // 极地与岛屿
-  { id: 29, name: '北极',       x: 300, y: 8,   w: 220, h: 32 },
-  { id: 30, name: '大西洋岛屿', x: 330, y: 205, w: 75,  h: 55 },
-  { id: 28, name: '南极洲',     x: 260, y: 458, w: 300, h: 30 }
-];
+// 30 个区域 → 国家代码映射
+const REGION_COUNTRIES = {
+  1: ['cn', 'jp', 'kr', 'kp', 'mn', 'tw'],
+  2: ['vn', 'th', 'ph', 'id', 'my', 'sg', 'mm', 'kh', 'la', 'bn', 'tl'],
+  3: ['in', 'pk', 'bd', 'lk', 'np', 'bt', 'mv', 'af'],
+  4: ['kz', 'uz', 'tm', 'kg', 'tj'],
+  5: ['sa', 'ir', 'iq', 'tr', 'sy', 'jo', 'lb', 'il', 'ye', 'om', 'ae', 'qa', 'kw', 'bh', 'am', 'az', 'ge'],
+  6: ['ru'],
+  7: ['gb', 'ie', 'fr', 'nl', 'be', 'lu', 'pt', 'es'],
+  8: ['it', 'gr', 'hr', 'rs', 'ba', 'me', 'mk', 'al', 'bg', 'ro', 'si', 'mt', 'cy'],
+  9: ['ua', 'by', 'md', 'lt', 'lv', 'ee', 'pl', 'sk', 'hu', 'cz'],
+  10: ['de', 'at', 'ch', 'li'],
+  11: ['se', 'no', 'fi', 'dk', 'is'],
+  12: ['eg', 'ly', 'tn', 'dz', 'ma', 'sd'],
+  13: ['ng', 'gh', 'ci', 'sn', 'ml', 'ne', 'bf', 'gn', 'gw', 'sl', 'lr', 'tg', 'bj', 'mr'],
+  14: ['cd', 'cf', 'td', 'cm', 'ga', 'cg', 'gq', 'ao'],
+  15: ['et', 'ke', 'tz', 'ug', 'rw', 'bi', 'so', 'ss', 'er', 'dj', 'mg'],
+  16: ['za', 'na', 'bw', 'zw', 'mz', 'zm', 'mw', 'ls', 'sz'],
+  17: ['us'],
+  18: ['ca'],
+  19: ['mx', 'gt', 'bz', 'sv', 'hn', 'ni', 'cr', 'pa'],
+  20: ['cu', 'jm', 'ht', 'do', 'pr', 'tt', 'bb', 'bs'],
+  21: ['co', 've', 'gy', 'sr', 'gf'],
+  22: ['pe', 'ec', 'bo'],
+  23: ['br'],
+  24: ['ar', 'cl', 'uy', 'py', 'fk'],
+  25: ['au'],
+  26: ['nz'],
+  27: ['pg', 'fj', 'sb', 'vu', 'ws', 'to', 'nc', 'pf'],
+};
 
-// 玩家文明固定 id（与后端一致）；用最醒目的红色
+const COUNTRY_REGION = new Map();
+for (const [regionId, codes] of Object.entries(REGION_COUNTRIES)) {
+  for (const code of codes) {
+    COUNTRY_REGION.set(code, Number(regionId));
+  }
+}
+
+// 玩家文明固定 id
 const PLAYER_CIV_ID = 1;
 const PLAYER_COLOR = '#ff2d2d';
 
-// 文明配色：玩家红色，其余按 civId 取稳定色相
+// 颜色收敛方案
+const FOG_COLOR = '#0f1319';         // 未探索
+const UNOWNED_FILL = '#3a3f4b';      // 无主
+const UNMAPPED_FILL = '#2f333d';     // 不属于任何区域的国家
+
+// 文明配色：玩家红色，其他文明蓝色系
 function colorForCiv(civId) {
   if (civId === PLAYER_CIV_ID) {
     return PLAYER_COLOR;
   }
-  const hue = (civId * 137) % 360;
-  return `hsl(${hue}, 60%, 55%)`;
+  // 蓝色系：hsl(210, 55%, 38% + (civId % 6) * 5%)
+  const lightness = 38 + (civId % 6) * 5;
+  return `hsl(210, 55%, ${lightness}%)`;
 }
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
-/** 按区域归属绘制世界地图：先海洋底、再各大洲轮廓、最后区域色块。 */
-function renderMap(regions) {
-  const svg = $('worldMap');
-  svg.innerHTML = '';
-  const owners = new Map();
-  for (const region of regions || []) {
-    owners.set(region.id, region);
+// 底图缓存
+let mapSvgPromise = null;
+let mapErrorShown = false;
+let lastRegions = [];
+let mapSvgSource = null; // 保存底图内容，用于渲染小地图和大地图
+
+/** 拉 world-map.svg 并缓存内容 */
+function loadMapSvg() {
+  if (mapSvgPromise === null) {
+    mapSvgPromise = (async () => {
+      const response = await fetch('/world-map.svg');
+      if (!response.ok) throw new Error(`/world-map.svg 返回 ${response.status}`);
+      const text = await response.text();
+      const parsed = new DOMParser().parseFromString(text, 'image/svg+xml');
+      const source = parsed.documentElement;
+      if (!source || source.nodeName.toLowerCase() !== 'svg' || parsed.querySelector('parsererror')) {
+        throw new Error('world-map.svg 解析失败');
+      }
+      mapSvgSource = source;
+      return true;
+    })().catch((error) => {
+      mapSvgPromise = null;
+      throw error;
+    });
   }
+  return mapSvgPromise;
+}
 
-  // 海洋底色
-  const ocean = document.createElementNS(SVG_NS, 'rect');
-  ocean.setAttribute('x', 0);
-  ocean.setAttribute('y', 0);
-  ocean.setAttribute('width', 1000);
-  ocean.setAttribute('height', 500);
-  ocean.setAttribute('fill', '#141a26');
-  svg.appendChild(ocean);
+/** 渲染地图到指定 SVG 容器 */
+function renderMapToSvg(svg, regions) {
+  if (!mapSvgSource) return;
+  const viewBox = mapSvgSource.getAttribute('viewBox') || '0 0 1000 500';
+  svg.setAttribute('viewBox', viewBox);
+  svg.removeAttribute('width');
+  svg.removeAttribute('height');
+  svg.innerHTML = mapSvgSource.innerHTML;
 
-  // 7 大洲轮廓（灰暗底，无边界色）
-  for (const continent of MAP_CONTINENTS) {
-    const polygon = document.createElementNS(SVG_NS, 'polygon');
-    polygon.setAttribute('points', continent.points);
-    polygon.setAttribute('fill', '#2a2d35');
-    polygon.setAttribute('stroke', '#3a3f4b');
-    polygon.setAttribute('stroke-width', '1.5');
-    polygon.setAttribute('stroke-linejoin', 'round');
-    const title = document.createElementNS(SVG_NS, 'title');
-    title.textContent = continent.name;
-    polygon.appendChild(title);
-    svg.appendChild(polygon);
-  }
+  const byId = new Map((Array.isArray(regions) ? regions : []).filter(Boolean).map((r) => [r.id, r]));
 
-  for (const shape of MAP_REGIONS) {
-    const region = owners.get(shape.id);
-    const ownerId = region ? region.ownerCivId : 0;
-    const ownerName = region && region.ownerCivName ? region.ownerCivName : '无主';
-
-    const rect = document.createElementNS(SVG_NS, 'rect');
-    rect.setAttribute('x', shape.x);
-    rect.setAttribute('y', shape.y);
-    rect.setAttribute('width', shape.w);
-    rect.setAttribute('height', shape.h);
-    rect.setAttribute('rx', 4);
-    rect.setAttribute('fill', ownerId === 0 ? '#444' : colorForCiv(ownerId));
-    rect.setAttribute('stroke', '#0b1020');
-    rect.setAttribute('stroke-width', '1.5');
-
-    // 悬停提示：区域名 · 归属文明名
-    const title = document.createElementNS(SVG_NS, 'title');
-    title.textContent = `${shape.name} · ${ownerName}`;
-    rect.appendChild(title);
-    svg.appendChild(rect);
-
-    const text = document.createElementNS(SVG_NS, 'text');
-    text.setAttribute('x', shape.x + shape.w / 2);
-    text.setAttribute('y', shape.y + shape.h / 2 + 4);
-    text.setAttribute('text-anchor', 'middle');
-    text.setAttribute('font-size', '11');
-    text.setAttribute('fill', '#e8ecf7');
-    text.setAttribute('pointer-events', 'none');
-    text.textContent = shape.name;
-    svg.appendChild(text);
+  for (const element of svg.querySelectorAll('[id]')) {
+    const regionId = COUNTRY_REGION.get(element.id);
+    if (regionId === undefined) {
+      element.setAttribute('fill', UNMAPPED_FILL);
+      continue;
+    }
+    const region = byId.get(regionId);
+    const fill = regionFill(region);
+    element.setAttribute('fill', fill);
+    ensureTitle(element).textContent = regionHoverText(region, regionId);
   }
 }
+
+/** 确保元素有 <title> 子元素 */
+function ensureTitle(element) {
+  for (const child of element.children) {
+    if (child.tagName.toLowerCase() === 'title') return child;
+  }
+  const title = document.createElementNS(SVG_NS, 'title');
+  element.insertBefore(title, element.firstChild);
+  return title;
+}
+
+/** 区域填充色 */
+function regionFill(region) {
+  if (region && region.explored === false) return FOG_COLOR;
+  const ownerId = region ? region.ownerCivId : 0;
+  return ownerId ? colorForCiv(ownerId) : UNOWNED_FILL;
+}
+
+/** 区域悬停提示 */
+function regionHoverText(region, regionId) {
+  if (region && region.explored === false) return '未探索';
+  const regionName = region && region.name ? region.name : `区域 ${regionId}`;
+  const ownerName = region && region.ownerCivName ? region.ownerCivName : '无主';
+  return `${regionName} · ${ownerName}`;
+}
+
+/** 渲染小地图（右下角，200x120，不响应交互） */
+function renderMiniMap(regions) {
+  const miniMap = $('miniMap');
+  renderMapToSvg(miniMap, regions);
+}
+
+/** 渲染大地图（弹出地图） */
+function renderBigMap(regions) {
+  const bigMap = $('bigMap');
+  renderMapToSvg(bigMap, regions);
+  // 给可点击区域添加标记
+  for (const element of bigMap.querySelectorAll('[id]')) {
+    const regionId = COUNTRY_REGION.get(element.id);
+    if (regionId !== undefined) {
+      element.classList.add('clickable');
+      element.dataset.regionId = regionId;
+    }
+  }
+}
+
+// ==================== 弹出地图交互 ====================
+
+// 地图视图状态（用于滚轮缩放和拖拽平移）
+let mapViewState = {
+  scale: 1,
+  translateX: 0,
+  translateY: 0,
+  isDragging: false,
+  lastX: 0,
+  lastY: 0,
+};
+
+const DEFAULT_VIEW = { scale: 1, translateX: 0, translateY: 0 };
+
+/** 更新大地图的 viewBox 实现缩放平移 */
+function updateBigMapView() {
+  const bigMap = $('bigMap');
+  const baseViewBox = mapSvgSource ? mapSvgSource.getAttribute('viewBox') : '0 0 1000 500';
+  const [baseX, baseY, baseW, baseH] = baseViewBox.split(' ').map(Number);
+
+  const w = baseW / mapViewState.scale;
+  const h = baseH / mapViewState.scale;
+  const x = baseX + mapViewState.translateX;
+  const y = baseY + mapViewState.translateY;
+
+  bigMap.setAttribute('viewBox', `${x} ${y} ${w} ${h}`);
+}
+
+/** 打开弹出地图 */
+async function openMapOverlay() {
+  $('mapOverlay').hidden = false;
+  closeRegionDetail();
+  try {
+    await loadMapSvg();
+    const regions = await api('/api/world/regions');
+    renderBigMap(regions);
+  } catch (error) {
+    showError('地图加载失败：' + error.message);
+  }
+}
+
+/** 关闭弹出地图 */
+function closeMapOverlay() {
+  $('mapOverlay').hidden = true;
+  resetMapView();
+  closeRegionDetail();
+}
+
+/** 重置视图 */
+function resetMapView() {
+  mapViewState = { ...DEFAULT_VIEW, isDragging: false, lastX: 0, lastY: 0 };
+  updateBigMapView();
+}
+
+/** 高亮玩家领地 */
+function highlightPlayerTerritory() {
+  const bigMap = $('bigMap');
+  const byId = new Map(lastRegions.map((r) => [r.id, r]));
+
+  // 清除之前的高亮
+  bigMap.querySelectorAll('.highlight-pulse').forEach((el) => {
+    el.classList.remove('highlight-pulse');
+  });
+
+  // 高亮玩家所有领土
+  for (const [regionId, region] of byId) {
+    if (region && region.ownerCivId === PLAYER_CIV_ID) {
+      const codes = REGION_COUNTRIES[regionId] || [];
+      for (const code of codes) {
+        const el = bigMap.querySelector(`[id="${code}"]`);
+        if (el) el.classList.add('highlight-pulse');
+      }
+    }
+  }
+}
+
+/** 关闭区域详情面板 */
+function closeRegionDetail() {
+  $('regionDetail').hidden = true;
+}
+
+/** 点击区域查看详情 */
+async function onRegionClick(regionId) {
+  const byId = new Map(lastRegions.map((r) => [r.id, r]));
+  const region = byId.get(Number(regionId));
+
+  if (!region || region.explored === false) {
+    showNotice('未探索', 2000);
+    return;
+  }
+
+  try {
+    const detail = await api(`/api/world/regions/${regionId}/detail`);
+    showRegionDetail(detail);
+  } catch (error) {
+    showError('获取区域详情失败：' + error.message);
+  }
+}
+
+/** 显示区域详情面板 */
+function showRegionDetail(detail) {
+  const panel = $('regionDetail');
+  panel.hidden = false;
+
+  $('regionName').textContent = detail.name || '-';
+
+  if (detail.ownerCivId && detail.ownerCivId !== 0) {
+    const civColor = colorForCiv(detail.ownerCivId);
+    $('civColor').style.backgroundColor = civColor;
+    $('civName').textContent = detail.ownerCivName || '未知文明';
+    $('civStats').hidden = false;
+    if (detail.ownerStats) {
+      $('civPop').textContent = num(detail.ownerStats.population);
+      $('civTech').textContent = num(detail.ownerStats.techLevel);
+      $('civTerr').textContent = detail.ownerStats.territoryCount;
+    }
+  } else {
+    $('civColor').style.backgroundColor = UNOWNED_FILL;
+    $('civName').textContent = '无主';
+    $('civStats').hidden = true;
+  }
+
+  // 邻接区域
+  const neighborsList = $('neighborsList');
+  neighborsList.innerHTML = '';
+  const neighbors = detail.neighbors || [];
+  if (neighbors.length === 0) {
+    neighborsList.innerHTML = '<li class="note">无邻接区域</li>';
+  } else {
+    for (const neighborName of neighbors) {
+      const li = document.createElement('li');
+      li.textContent = neighborName;
+      li.addEventListener('click', () => {
+        // 查找邻居对应的 regionId
+        const neighborRegion = lastRegions.find((r) => r.name === neighborName);
+        if (neighborRegion) {
+          closeRegionDetail();
+          onRegionClick(neighborRegion.id);
+        }
+      });
+      neighborsList.appendChild(li);
+    }
+  }
+
+  // 最近事件
+  const eventsList = $('regionEvents');
+  eventsList.innerHTML = '';
+  const events = detail.recentEvents || [];
+  if (events.length === 0) {
+    eventsList.innerHTML = '<li class="note">暂无相关事件</li>';
+  } else {
+    for (const event of events.slice(-10)) {
+      const li = document.createElement('li');
+      li.innerHTML = `<span class="year">Y${event.year}</span> <span class="type">${RARITY_LABELS[event.type] || event.type}</span><span class="desc">${event.description}</span>`;
+      eventsList.appendChild(li);
+    }
+  }
+}
+
+/** 初始化大地图交互事件 */
+function initBigMapEvents() {
+  const bigMap = $('bigMap');
+
+  // 点击区域
+  bigMap.addEventListener('click', (e) => {
+    if (mapViewState.isDragging) return;
+    const target = e.target.closest('[data-region-id]');
+    if (target && target.dataset.regionId) {
+      onRegionClick(target.dataset.regionId);
+    }
+  });
+
+  // 拖拽平移
+  bigMap.addEventListener('mousedown', (e) => {
+    if (e.target.closest('[data-region-id]')) return;
+    mapViewState.isDragging = true;
+    mapViewState.lastX = e.clientX;
+    mapViewState.lastY = e.clientY;
+    e.preventDefault();
+  });
+
+  document.addEventListener('mousemove', (e) => {
+    if (!mapViewState.isDragging) return;
+    const dx = (e.clientX - mapViewState.lastX) * 2;
+    const dy = (e.clientY - mapViewState.lastY) * 2;
+    mapViewState.translateX -= dx / mapViewState.scale;
+    mapViewState.translateY -= dy / mapViewState.scale;
+    mapViewState.lastX = e.clientX;
+    mapViewState.lastY = e.clientY;
+    updateBigMapView();
+  });
+
+  document.addEventListener('mouseup', () => {
+    mapViewState.isDragging = false;
+  });
+
+  // 滚轮缩放
+  bigMap.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
+    const newScale = Math.max(0.5, Math.min(10, mapViewState.scale * zoomFactor));
+
+    // 以鼠标位置为中心缩放
+    const rect = bigMap.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+    const ratioX = mouseX / rect.width;
+    const ratioY = mouseY / rect.height;
+
+    const baseViewBox = mapSvgSource ? mapSvgSource.getAttribute('viewBox') : '0 0 1000 500';
+    const [, , baseW, baseH] = baseViewBox.split(' ').map(Number);
+
+    const currentW = baseW / mapViewState.scale;
+    const currentH = baseH / mapViewState.scale;
+    const currentX = parseFloat(mapSvgSource ? mapSvgSource.getAttribute('viewBox').split(' ')[0] : '0') + mapViewState.translateX;
+    const currentY = parseFloat(mapSvgSource ? mapSvgSource.getAttribute('viewBox').split(' ')[1] : '0') + mapViewState.translateY;
+
+    mapViewState.translateX = currentX + currentW * ratioX - (currentW * ratioX / newScale * mapViewState.scale);
+    mapViewState.translateY = currentY + currentH * ratioY - (currentH * ratioY / newScale * mapViewState.scale);
+    mapViewState.scale = newScale;
+
+    updateBigMapView();
+  });
+}
+
+// ==================== 主刷新逻辑 ====================
 
 async function refresh() {
   const [state, events, regions] = await Promise.all([
@@ -277,7 +671,18 @@ async function refresh() {
   ]);
   renderWorld(state);
   renderEvents(events);
-  renderMap(regions);
+  lastRegions = Array.isArray(regions) ? regions : [];
+
+  try {
+    await loadMapSvg();
+    mapErrorShown = false;
+    renderMiniMap(regions);
+  } catch (error) {
+    if (!mapErrorShown) {
+      mapErrorShown = true;
+      showError('世界地图加载失败：' + error.message);
+    }
+  }
 }
 
 async function run(action) {
@@ -312,13 +717,11 @@ async function advanceYears() {
     btn.disabled = false;
     btn.textContent = '推进';
   }
-  // 全部批次推完后：每 1 秒刷新一次，共 5 次，不等下一轮自动刷新
   for (let i = 1; i <= NARRATIVE_POLL_TIMES; i++) {
     setTimeout(() => refresh().catch(() => {}), NARRATIVE_POLL_INTERVAL_MS * i);
   }
 }
 
-// 跳过时代：可选目标由后端算（当前时代之后最多 5 个），前端只负责让用户选一个
 async function skipEra() {
   const options = await api('/api/world/eras');
   const targets = (options && options.targets) || [];
@@ -328,17 +731,13 @@ async function skipEra() {
   }
   const list = targets.map((t, i) => `${i + 1}. ${t.name}`).join('\n');
   const answer = prompt(`当前时代：${options.currentEra}\n\n跳到哪个时代？输入序号：\n${list}`, '1');
-  if (answer === null) {
-    return;
-  }
+  if (answer === null) return;
   const chosen = targets[Number(answer.trim()) - 1];
   if (!chosen) {
     showError('没有这个序号，已取消。');
     return;
   }
-  if (!confirm(`确定跳到「${chosen.name}」？科技、人口、食物、资源都会按时代比例整体放大。`)) {
-    return;
-  }
+  if (!confirm(`确定跳到「${chosen.name}」？科技、人口、食物、资源都会按时代比例整体放大。`)) return;
   const result = await post('/api/world/skip-era', { targetEraIndex: chosen.index });
   if (result && result.result) {
     showNotice(result.result, 6000);
@@ -349,7 +748,6 @@ async function skipEra() {
 
 function bind() {
   $('advance').addEventListener('click', () => run(advanceYears));
-
   $('skipEra').addEventListener('click', () => run(skipEra));
 
   $('runToMajor').addEventListener('click', () => run(async () => {
@@ -377,11 +775,8 @@ function bind() {
     }
   }));
 
-  // 新游戏：清空世界从零开始（不可恢复，先确认）
   $('newGame').addEventListener('click', () => run(async () => {
-    if (!confirm('确定要重开吗？当前世界会被清空，无法恢复。')) {
-      return;
-    }
+    if (!confirm('确定要重开吗？当前世界会被清空，无法恢复。')) return;
     const result = await post('/api/world/new-game');
     if (result && result.error) {
       showError('世界已重置，但存档写入失败：' + result.error);
@@ -390,6 +785,32 @@ function bind() {
     showNotice(result && result.result ? result.result : '世界已重置。', 6000);
   }));
 
+  // 科技树
+  $('openTechTree').addEventListener('click', () => run(openTechTree));
+  $('closeTechTree').addEventListener('click', closeTechTree);
+  $('techPanel').addEventListener('click', (event) => {
+    if (event.target === $('techPanel')) closeTechTree();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !$('techPanel').hidden) closeTechTree();
+  });
+
+  // 小地图点击打开大地图
+  $('miniMapContainer').addEventListener('click', () => openMapOverlay());
+
+  // 大地图控制按钮
+  $('closeMapOverlay').addEventListener('click', () => closeMapOverlay());
+  $('highlightPlayer').addEventListener('click', () => highlightPlayerTerritory());
+  $('resetMapView').addEventListener('click', () => resetMapView());
+
+  // 大地图键盘快捷键
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !$('mapOverlay').hidden) {
+      closeMapOverlay();
+    }
+  });
+
+  // 玩家指挥
   const sendCommand = () => run(async () => {
     const text = $('commandText').value.trim();
     if (!text) {
@@ -413,25 +834,19 @@ function bind() {
 
   $('sendCommand').addEventListener('click', sendCommand);
   $('commandText').addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') {
-      sendCommand();
-    }
+    if (event.key === 'Enter') sendCommand();
   });
+
+  // 初始化大地图交互
+  initBigMapEvents();
 }
 
-// 自动刷新：每 3 秒拉一次最新数据，用于看到异步生成的 AI 叙事
 let autoRefreshTimer = null;
 
 function startAutoRefresh() {
-  if (autoRefreshTimer !== null) {
-    return;
-  }
+  if (autoRefreshTimer !== null) return;
   autoRefreshTimer = setInterval(() => {
-    // 推进进行中（推进按钮被禁用）时跳过本次，避免与手动推进冲突
-    if ($('advance').disabled) {
-      return;
-    }
-    // 自动刷新失败不打扰用户，等下一次轮询重试
+    if ($('advance').disabled) return;
     refresh().catch(() => {});
   }, AUTO_REFRESH_INTERVAL_MS);
 }

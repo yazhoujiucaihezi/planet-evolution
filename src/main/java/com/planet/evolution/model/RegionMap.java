@@ -60,6 +60,37 @@ public final class RegionMap {
         byId.put(id, region);
     }
 
+    /**
+     * 动态新增一个区域（玩家自由行动用，例如「飞出地球」开辟新地盘）。
+     * id 取当前最大 id + 1；直接把归属设为给定文明；neighbors 里不存在的区域 id 会被过滤掉。
+     *
+     * @param name        区域名
+     * @param ownerCivId  归属文明 id（0 表示无主）
+     * @param neighbors   邻接区域 id 列表，可为 null / 空
+     * @return 新建的区域
+     */
+    public Region addDynamicRegion(String name, int ownerCivId, List<Integer> neighbors) {
+        int nextId = 1;
+        for (Region region : regions) {
+            if (region.getId() >= nextId) {
+                nextId = region.getId() + 1;
+            }
+        }
+        List<Integer> valid = new ArrayList<>();
+        if (neighbors != null) {
+            for (Integer id : neighbors) {
+                if (id != null && byId.containsKey(id)) {
+                    valid.add(id);
+                }
+            }
+        }
+        Region region = new Region(nextId, name, valid);
+        region.setOwnerCivId(ownerCivId);
+        regions.add(region);
+        byId.put(nextId, region);
+        return region;
+    }
+
     /** 全部区域（只读）。 */
     public List<Region> all() {
         return Collections.unmodifiableList(regions);

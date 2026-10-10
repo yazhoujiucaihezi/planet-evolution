@@ -14,12 +14,16 @@ public class Region {
     private final String name;
     private int ownerCivId;
     private final List<Integer> neighbors;
+    /** 玩家是否已探索该区域：false 表示还在黑雾里（前端盖深色遮罩）。 */
+    private boolean explored;
 
     public Region(int id, String name, List<Integer> neighbors) {
         this.id = id;
         this.name = name;
         this.ownerCivId = UNOWNED;
         this.neighbors = new ArrayList<>(neighbors);
+        // 默认未探索，开局由 World.exploreAround 点亮玩家领土及一圈邻区
+        this.explored = false;
     }
 
     public int getId() {
@@ -45,5 +49,14 @@ public class Region {
     /** 是否无主。 */
     public boolean isUnowned() {
         return ownerCivId == UNOWNED;
+    }
+
+    /** 玩家是否已探索；false 表示黑雾。 */
+    public boolean isExplored() {
+        return explored;
+    }
+
+    public void setExplored(boolean explored) {
+        this.explored = explored;
     }
 }

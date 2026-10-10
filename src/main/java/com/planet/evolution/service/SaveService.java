@@ -32,6 +32,9 @@ public class SaveService {
     /** 存档路径（相对进程工作目录）。 */
     private static final String SAVE_PATH = "logs/world-save.json";
 
+    /** 玩家文明固定为 id = 1（与 ChatController / EvolutionEngine 一致），旧存档缺探索字段时按它重算。 */
+    private static final long PLAYER_CIV_ID = 1L;
+
     private final World world;
     private final EvolutionEngine engine;
     private final WorldMapper worldMapper;
@@ -106,7 +109,10 @@ public class SaveService {
         for (Civilization civilization : world.getCivilizations()) {
             civilizations.add(new CivilizationSave(civilization.getId(), civilization.getName(),
                     civilization.getFoundedYear(), civilization.getPopulation(), civilization.getTechLevel(),
-                    new ArrayList<>(civilization.getTerritory())));
+                    new ArrayList<>(civilization.getTerritory()), civilization.getScience(),
+                    civilization.getWelfare(), civilization.getResource(), civilization.getMilitary(),
+                    new ArrayList<>(civilization.getUnlockedTechs()), civilization.getCurrentResearchId(),
+                    civilization.getResearchProgress()));
         }
         List<GameEvent> events = new ArrayList<>();
         for (GameEvent event : worldMapper.selectEvents()) {
@@ -116,10 +122,11 @@ public class SaveService {
         }
         return new WorldSave(world.getYear(), planet.getName(), planet.getTemperature(),
                 planet.getHabitability(), engine.getFood(), engine.getResources(),
-                engine.currentEraIndex(), civilizations, events);
+                engine.currentEraIndex(), civilizations, events, world.exploredRegionIds(),
+                engine.getResearchMode());
     }
 
-    /** 把存档写回世界（顺序：星球 -> 文明 -> 年份 -> 事件 -> 引擎状态）。 */
+    /** 把存档写回世界（顺序：星球 -> 文明 -> 年份 -> 探索 -> 事件 -> 引擎状态）。 */
     private void restore(WorldSave save) {
         Planet planet = world.getPlanet();
         if (save.planetName() != null) {
@@ -136,12 +143,25 @@ public class SaveService {
                 }
                 Civilization civilization = new Civilization(c.id(), c.name(), c.foundedYear(), c.population());
                 civilization.setTechLevel(c.techLevel());
+                // 四柱：旧存档没有这几个字段（读出 null）时回落到初始值 50，
+                // 不能用原始 int——缺字段会被 Jackson 读成 0，那样一进游戏就是「四柱全崩」
+                civilization.setScience(pillarOr(c.science()));
+                civilization.setWelfare(pillarOr(c.welfare()));
+                civilization.setResource(pillarOr(c.resource()));
+                civilization.setMilitary(pillarOr(c.military()));
                 civilization.replaceTerritory(c.territory());
+                // 科技树：旧存档没有这几个字段，unlockedTechs / currentResearchId 读出 null、进度读出 0
+                civilization.replaceUnlockedTechs(c.unlockedTechs());
+                civilization.setCurrentResearchId(c.currentResearchId());
+                civilization.setResearchProgress(progressOr(c.researchProgress()));
                 world.restoreCivilization(civilization);
             }
         }
 
         world.setYear(save.year());
+
+        // 探索状态：civilizations 已放回，旧存档缺这一项时按玩家领土重算一圈（exploredRegionIds 为 null）
+        world.restoreExploration(save.exploredRegionIds(), PLAYER_CIV_ID);
 
         List<GameEvent> events = new ArrayList<>();
         if (save.events() != null) {
@@ -154,16 +174,35 @@ public class SaveService {
         worldMapper.replaceEvents(events);
 
         engine.restoreState(save.food(), save.resources(), save.currentEraIndex());
+        // 研究模式：旧存档没有这个字段（读出 null）时保持引擎默认的 passive
+        if (save.researchMode() != null) {
+            engine.setResearchMode(save.researchMode());
+        }
     }
 
-    /** 存档文件结构。 */
+    /** 存档文件结构。exploredRegionIds 是玩家已探索（非黑雾）的区域 id。 */
     public record WorldSave(int year, String planetName, double temperature, double habitability,
             double food, double resources, int currentEraIndex,
-            List<CivilizationSave> civilizations, List<GameEvent> events) {
+            List<CivilizationSave> civilizations, List<GameEvent> events, List<Integer> exploredRegionIds,
+            String researchMode) {
     }
 
-    /** 存档里的单个文明。 */
+    /**
+     * 存档里的单个文明。四柱与研究进度用包装类型：旧存档缺这几个字段时读出 null，
+     * 好和「真的是 0」区分开。
+     */
     public record CivilizationSave(long id, String name, int foundedYear, long population, int techLevel,
-            List<Integer> territory) {
+            List<Integer> territory, Integer science, Integer welfare, Integer resource, Integer military,
+            List<String> unlockedTechs, String currentResearchId, Double researchProgress) {
+    }
+
+    /** 存档里缺四柱字段（旧存档）时按初始值 50 处理。 */
+    private static int pillarOr(Integer value) {
+        return value == null ? Civilization.PILLAR_INITIAL : value;
+    }
+
+    /** 存档里缺研究进度（旧存档）时按 0 处理。 */
+    private static double progressOr(Double value) {
+        return value == null ? 0.0 : Math.max(0, value);
     }
 }

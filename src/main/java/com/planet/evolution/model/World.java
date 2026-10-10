@@ -98,6 +98,79 @@ public class World {
         for (Region region : regionMap.all()) {
             region.setOwnerCivId(Region.UNOWNED);
         }
+        // 归属清了，探索状态一并回到黑雾；恢复存档时会由 restoreExploration 重新点亮
+        clearExploration();
+    }
+
+    // ==================== 探索（黑雾） ====================
+
+    /**
+     * 把该文明已占的领土及其一圈接壤区域标记为已探索。
+     * 每次玩家扩张领土后调用，让新领土和它周边的黑雾散开。
+     */
+    public void exploreAround(Civilization civilization) {
+        if (civilization == null) {
+            return;
+        }
+        for (Integer regionId : civilization.getTerritory()) {
+            Region owned = regionMap.get(regionId);
+            if (owned == null) {
+                continue;
+            }
+            owned.setExplored(true);
+            for (Integer neighborId : owned.getNeighbors()) {
+                Region neighbor = regionMap.get(neighborId);
+                if (neighbor != null) {
+                    neighbor.setExplored(true);
+                }
+            }
+        }
+    }
+
+    /** 新游戏用：全部区域回到黑雾。 */
+    public void clearExploration() {
+        for (Region region : regionMap.all()) {
+            region.setExplored(false);
+        }
+    }
+
+    /** 存档用：当前已探索区域 id（按 id 升序）。 */
+    public List<Integer> exploredRegionIds() {
+        List<Integer> ids = new ArrayList<>();
+        for (Region region : regionMap.all()) {
+            if (region.isExplored()) {
+                ids.add(region.getId());
+            }
+        }
+        return ids;
+    }
+
+    /**
+     * 恢复存档用：按存档里的已探索区域重新点亮。
+     * 旧存档没有该字段（exploredIds 为 null）时，退回按玩家领土重算一圈，保证与开局一致。
+     */
+    public void restoreExploration(List<Integer> exploredIds, long playerCivId) {
+        clearExploration();
+        if (exploredIds == null) {
+            exploreAround(findCivilization(playerCivId));
+            return;
+        }
+        for (Integer regionId : exploredIds) {
+            Region region = regionId == null ? null : regionMap.get(regionId);
+            if (region != null) {
+                region.setExplored(true);
+            }
+        }
+    }
+
+    /** 按 id 找文明，找不到返回 null。 */
+    public Civilization findCivilization(long id) {
+        for (Civilization civilization : civilizations) {
+            if (civilization.getId() == id) {
+                return civilization;
+            }
+        }
+        return null;
     }
 
     /** 新游戏用：把文明 id 计数归零，让重开后的第一个文明仍然是 id=1（玩家文明）。 */

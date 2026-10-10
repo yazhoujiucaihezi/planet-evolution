@@ -58,6 +58,14 @@ public class EvolutionEngine {
     private static final int AI_DECISION_TECH_GAIN = 50;
     /** AI 效果的数值上限：模型偶尔会给离谱数字，兜一下免得把模拟搞崩。 */
     private static final long AI_EFFECT_LIMIT = 1_000_000L;
+    /** 研究模式 active：玩家文明不自动研究，等玩家指令。 */
+    public static final String RESEARCH_MODE_ACTIVE = "active";
+    /** 研究模式 passive：玩家文明自动研究（默认）。 */
+    public static final String RESEARCH_MODE_PASSIVE = "passive";
+    /** 研究进度：每年增加 techLevel × 该系数。 */
+    private static final double RESEARCH_PROGRESS_PER_TECH = 0.1;
+    /** 科技发明的稀有度（AI_EVENT 口径，>= 60 属重大事件）。 */
+    private static final int RESEARCH_RARITY = AI_EVENT_RARITY;
     /** 规则事件降频系数：AI 接管演化后，灾难/战争/科技突破只作兜底（灾难 2% → 0.5%）。 */
     private static final double FALLBACK_EVENT_FACTOR = 0.25;
     /** 世界初始状态：与 WorldConfig 的 new Planet("盖亚", 15.0, 1.0) 及构造函数初值保持一致。 */
@@ -81,6 +89,12 @@ public class EvolutionEngine {
 
     /** 当前时代下标，初始为 0（蒙昧时代）。 */
     private int currentEraIndex = 0;
+
+    /**
+     * 科技树的研究模式，默认 passive（玩家文明自动研究）。
+     * active 时玩家文明停下来等指令，AI 文明两种模式下都自动研究。
+     */
+    private String researchMode = RESEARCH_MODE_PASSIVE;
 
     /** 是否启用 AI 叙事：推进年数多时关闭，避免大量异步叙事。 */
     private boolean narrateEnabled = true;
@@ -158,6 +172,8 @@ public class EvolutionEngine {
         growPopulation(year);
         checkNewCivilization(year);
         growTech();
+        // 科技树：先涨科技、再按科技水平推进研究进度
+        tickResearch();
         world.tick();
         if (world.getYear() % 100 == 0 && world.getYear() > 0) {
             narrateCentury();
@@ -634,7 +650,9 @@ public class EvolutionEngine {
         // 文明 id 计数与命名计数一并归零：重开后的「人类」必须还是 id=1（玩家文明）
         nextCivilizationId = 1;
         world.resetCivilizationIdCounter();
-        world.spawnCivilization("人类");
+        // 重开后的第一个文明仍是玩家（id=1）：点亮它的领土与一圈邻区，其余回到黑雾
+        Civilization player = world.spawnCivilization("人类");
+        world.exploreAround(player);
         return "世界已重置，从第 0 年开始。";
     }
 
@@ -734,6 +752,132 @@ public class EvolutionEngine {
             }
             civilization.setTechLevel((int) Math.floor(civilization.getTechLevel() + growth));
         }
+    }
+
+    // ==================== 科技树 ====================
+
+    /** 当前研究模式：active（玩家等指令）或 passive（玩家自动研究）。 */
+    public String getResearchMode() {
+        return researchMode;
+    }
+
+    /**
+     * 设置研究模式，只认 active / passive（大小写不敏感），其余值忽略。
+     *
+     * @return true 表示已切换；false 表示入参非法、模式保持原样
+     */
+    public boolean setResearchMode(String mode) {
+        if (mode == null) {
+            return false;
+        }
+        String wanted = mode.trim().toLowerCase();
+        if (RESEARCH_MODE_ACTIVE.equals(wanted)) {
+            researchMode = RESEARCH_MODE_ACTIVE;
+            return true;
+        }
+        if (RESEARCH_MODE_PASSIVE.equals(wanted)) {
+            researchMode = RESEARCH_MODE_PASSIVE;
+            return true;
+        }
+        return false;
+    }
+
+    /** 是否处于主动模式（玩家文明不自动研究）。 */
+    public boolean isResearchActive() {
+        return RESEARCH_MODE_ACTIVE.equals(researchMode);
+    }
+
+    /**
+     * 每年一次的研究推进，所有存活文明都走这里：
+     * <ul>
+     *   <li>没有在研究的：AI 文明按性格挑一个；玩家文明被动模式下同 AI，主动模式跳过等指令</li>
+     *   <li>有在研究的：进度 += techLevel × 0.1（见 RESEARCH_PROGRESS_PER_TECH）</li>
+     *   <li>进度攒够 cost：解锁、科技 + techBonus、写一条 AI_EVENT、清空当前研究</li>
+     * </ul>
+     */
+    private void tickResearch() {
+        int year = world.getYear();
+        for (Civilization civilization : world.getCivilizations()) {
+            if (civilization.getPopulation() <= 0) {
+                continue;
+            }
+            boolean player = civilization.getId() == PLAYER_CIV_ID;
+            if (civilization.getCurrentResearchId() == null) {
+                // 主动模式：玩家文明的选题权在玩家手里，这里不替它选
+                if (player && isResearchActive()) {
+                    continue;
+                }
+                TechNode next = pickResearch(civilization);
+                if (next == null) {
+                    // 科技树已全部解锁（或没有满足前置的节点），无事可做
+                    continue;
+                }
+                civilization.setCurrentResearchId(next.id());
+                civilization.setResearchProgress(0);
+            }
+            TechNode node = TechTree.getById(civilization.getCurrentResearchId());
+            if (node == null) {
+                // 存档里的 id 不在当前科技树上（换过版本）：清掉，下一年重选
+                civilization.setCurrentResearchId(null);
+                civilization.setResearchProgress(0);
+                continue;
+            }
+            civilization.setResearchProgress(civilization.getResearchProgress()
+                    + civilization.getTechLevel() * RESEARCH_PROGRESS_PER_TECH);
+            if (civilization.getResearchProgress() >= node.cost()) {
+                completeResearch(year, civilization, node);
+            }
+        }
+    }
+
+    /**
+     * 挑下一个研究项目：好战文明优先军事，和平文明优先经济/社会；
+     * 偏好分支没有可选项时，退回全部可研究节点里随机。
+     */
+    private TechNode pickResearch(Civilization civilization) {
+        List<TechNode> available = TechTree.getAvailable(civilization);
+        if (available.isEmpty()) {
+            return null;
+        }
+        boolean warlike = isWarlike(civilization);
+        List<TechNode> preferred = new ArrayList<>();
+        for (TechNode node : available) {
+            boolean match = warlike
+                    ? TechTree.BRANCH_MILITARY.equals(node.branch())
+                    : TechTree.BRANCH_ECONOMY.equals(node.branch())
+                            || TechTree.BRANCH_SOCIETY.equals(node.branch());
+            if (match) {
+                preferred.add(node);
+            }
+        }
+        List<TechNode> pool = preferred.isEmpty() ? available : preferred;
+        return pool.get(random.nextInt(pool.size()));
+    }
+
+    /**
+     * 文明性格（用于选题偏好）：军事柱比民生柱高 5 以上算好战，低 5 以上算和平。
+     * 非玩家文明的四柱默认都是 50、没有差异，此时按 id 稳定分档——
+     * 偶数好战、奇数和平：既能分出两种性格，又不消耗随机数、重开一局性格也不变。
+     */
+    private boolean isWarlike(Civilization civilization) {
+        int diff = civilization.getMilitary() - civilization.getWelfare();
+        if (diff > 5) {
+            return true;
+        }
+        if (diff < -5) {
+            return false;
+        }
+        return civilization.getId() % 2 == 0;
+    }
+
+    /** 研究完成：解锁节点、加科技值、写一条「发明了【某某】」的世界事件。 */
+    private void completeResearch(int year, Civilization civilization, TechNode node) {
+        civilization.unlockTech(node.id());
+        civilization.setTechLevel(civilization.getTechLevel() + node.techBonus());
+        civilization.setCurrentResearchId(null);
+        civilization.setResearchProgress(0);
+        record(year, EventType.AI_EVENT,
+                civilization.getName() + "发明了【" + node.name() + "】", RESEARCH_RARITY);
     }
 
     /** 按总科技档位随机取一种灾难类型：科技越高，灾难越"未来感"。 */
