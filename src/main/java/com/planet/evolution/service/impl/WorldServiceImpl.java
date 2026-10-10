@@ -6,6 +6,7 @@ import org.springframework.stereotype.Service;
 
 import com.planet.evolution.mapper.WorldMapper;
 import com.planet.evolution.model.World;
+import com.planet.evolution.service.SaveService;
 import com.planet.evolution.service.WorldService;
 import com.planet.evolution.simulation.EvolutionEngine;
 import com.planet.evolution.simulation.GameEvent;
@@ -17,26 +18,41 @@ public class WorldServiceImpl implements WorldService {
     private final World world;
     private final EvolutionEngine engine;
     private final WorldMapper worldMapper;
+    private final SaveService saveService;
 
-    public WorldServiceImpl(World world, EvolutionEngine engine, WorldMapper worldMapper) {
+    public WorldServiceImpl(World world, EvolutionEngine engine, WorldMapper worldMapper,
+            SaveService saveService) {
         this.world = world;
         this.engine = engine;
         this.worldMapper = worldMapper;
+        this.saveService = saveService;
     }
 
     @Override
     public void advance(int years) {
+        engine.setNarrateEnabled(years <= 100);
         for (int i = 0; i < years; i++) {
             engine.tick();
             for (GameEvent event : engine.drainEvents()) {
                 worldMapper.insertEvent(event);
             }
+            saveEveryHundredYears();
+        }
+    }
+
+    /** 每推进 100 年自动存档一次（存档失败只记日志，不影响推进）。 */
+    private void saveEveryHundredYears() {
+        int year = world.getYear();
+        if (year > 0 && year % 100 == 0) {
+            saveService.save();
         }
     }
 
     @Override
     public MajorRunResult advanceToNextMajorEvent(int maxYears) {
         int advanced = 0;
+        // 长推进：本次不写 AI 叙事
+        engine.setNarrateEnabled(false);
         while (advanced < maxYears) {
             engine.tick();
             advanced++;
@@ -47,6 +63,7 @@ public class WorldServiceImpl implements WorldService {
                     major = event;
                 }
             }
+            saveEveryHundredYears();
             if (major != null) {
                 // 遇到重大事件立即结束本次推进
                 return new MajorRunResult(world.getYear(), advanced, true, false, major);

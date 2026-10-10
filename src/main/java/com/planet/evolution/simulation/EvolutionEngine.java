@@ -8,6 +8,7 @@ import java.util.Random;
 import org.springframework.beans.factory.annotation.Autowired;
 
 import com.planet.evolution.ai.AiNarrator;
+import com.planet.evolution.ai.NarrativeExecutor;
 import com.planet.evolution.mapper.WorldMapper;
 import com.planet.evolution.model.Civilization;
 import com.planet.evolution.model.World;
@@ -58,6 +59,9 @@ public class EvolutionEngine {
     /** 当前时代下标，初始为 0（蒙昧时代）。 */
     private int currentEraIndex = 0;
 
+    /** 是否启用 AI 叙事：推进年数多时关闭，避免大量异步叙事。 */
+    private boolean narrateEnabled = true;
+
     /** 灾难类型档位，按总科技分档，索引与 DISASTER_TECH_BREAKS 对应。 */
     private static final String[][] DISASTER_TIERS = {
         {"大旱", "洪水", "瘟疫", "野兽袭击"},
@@ -76,6 +80,9 @@ public class EvolutionEngine {
     // 取最近百年事件用于构造叙事 prompt
     @Autowired
     private WorldMapper worldMapper;
+    // AI 叙事异步执行器：提交后立即返回，不阻塞 tick
+    @Autowired
+    private NarrativeExecutor narrativeExecutor;
 
     private final World world;
     private final PlanetProfile profile;
@@ -98,6 +105,11 @@ public class EvolutionEngine {
         this.random = new Random(seed);
         this.food = 600.0;
         this.resources = 400.0;
+    }
+
+    /** 设置是否启用 AI 叙事。 */
+    public void setNarrateEnabled(boolean enabled) {
+        this.narrateEnabled = enabled;
     }
 
     /** 推进一年。 */
@@ -140,15 +152,31 @@ public class EvolutionEngine {
                 + "，正式从" + prevEra + "跨入" + eraName
                 + "。请写一段 100 字左右的历史叙事，描述这个时代的开端，"
                 + "风格像《银河系漫游指南》，只写叙事，不要分析，不要解释。";
-        String story = aiNarrator == null ? null : aiNarrator.narrate(prompt);
-        if (story != null) {
-            System.out.println("[时代晋升] " + eraName + "：" + story);
-            record(world.getYear(), EventType.AI_NARRATIVE, story, 80);
+        if (narrativeExecutor == null || aiNarrator == null || worldMapper == null) {
+            // 直接 new 构造的引擎（离线测试）没有注入，跳过叙事
+            return;
+        }
+        // 时代该升就升；仅在启用叙事时提交 AI 叙事任务
+        if (narrateEnabled) {
+            // 参数在提交前算好，Runnable 内不再读引擎/世界状态
+            final int storyYear = world.getYear();
+            final String eraLabel = eraName;
+            final String eraPrompt = prompt;
+            narrativeExecutor.submit(() -> {
+                String story = aiNarrator.narrate(eraPrompt);
+                if (story != null) {
+                    System.out.println("[时代晋升] " + eraLabel + "：" + story);
+                    // 直接写 mapper：异步任务完成时 tick 的 drainEvents 早已结束，
+                    // 写进引擎内部缓冲不会再被搬走
+                    worldMapper.insertEvent(new GameEvent(storyYear, EventType.AI_NARRATIVE, story, 80));
+                }
+            });
         }
     }
 
     /** 每百年：取最近 100 年的真实事件拼 prompt，交给 AI 写叙事，并作为一条事件写入历史。 */
     private void narrateCentury() {
+        if (!narrateEnabled) return;
         // 直接 new 构造的引擎（如离线测试）没有 Spring 注入，跳过叙事
         if (aiNarrator == null || worldMapper == null) {
             return;
@@ -159,7 +187,7 @@ public class EvolutionEngine {
                 .append(startYear).append(" 到 ").append(endYear)
                 .append(" 年发生的事件，请写成一段 100 字左右的历史叙事，")
                 .append("风格像《银河系漫游指南》，只写叙事，不要分析，不要解释：\n");
-        int count = 0;
+        int majorCount = 0;
         for (GameEvent event : worldMapper.selectEvents()) {
             // 只取本世纪的普通事件；过往的 AI 叙事不作为素材，避免自我引用
             if (event.year() < startYear || event.year() > endYear
@@ -168,19 +196,29 @@ public class EvolutionEngine {
             }
             prompt.append("- 第 ").append(event.year()).append(" 年：")
                     .append(event.description()).append('\n');
-            count++;
+            if (event.rarity() >= MajorEventRules.MAJOR_THRESHOLD) {
+                majorCount++;
+            }
         }
-        if (count == 0) {
-            // 本世纪没有事件，不调用 AI
+        if (majorCount == 0) {
+            // 本世纪没有重大事件（稀有度 >= 60），不调用 AI
             return;
         }
-        String story = aiNarrator.narrate(prompt.toString());
-        if (story == null) {
+        if (narrativeExecutor == null) {
             return;
         }
-        System.out.println("[AI叙事] 第 " + endYear + " 年：" + story);
-        // 同时写入事件列表，前端历史事件即可看到
-        record(endYear, EventType.AI_NARRATIVE, story, AI_NARRATIVE_RARITY);
+        // 参数在提交前算好，Runnable 内不再读引擎/世界状态
+        final int storyYear = endYear;
+        final String centuryPrompt = prompt.toString();
+        narrativeExecutor.submit(() -> {
+            String story = aiNarrator.narrate(centuryPrompt);
+            if (story == null) {
+                return;
+            }
+            System.out.println("[AI叙事] 第 " + storyYear + " 年：" + story);
+            // 直接写 mapper，保证前端立即可见（不依赖后续 tick 的 drainEvents）
+            worldMapper.insertEvent(new GameEvent(storyYear, EventType.AI_NARRATIVE, story, AI_NARRATIVE_RARITY));
+        });
     }
 
     private void produce() {
@@ -443,17 +481,24 @@ public class EvolutionEngine {
     }
 
     private void record(int year, EventType type, String description, int rarity) {
-        events.add(new GameEvent(year, type, description, rarity));
+        // AI 叙事线程也会写事件，加锁保护
+        synchronized (events) {
+            events.add(new GameEvent(year, type, description, rarity));
+        }
     }
 
     public List<GameEvent> getEvents() {
-        return Collections.unmodifiableList(events);
+        synchronized (events) {
+            return Collections.unmodifiableList(new ArrayList<>(events));
+        }
     }
 
     public List<GameEvent> drainEvents() {
-        List<GameEvent> drained = new ArrayList<>(events);
-        events.clear();
-        return drained;
+        synchronized (events) {
+            List<GameEvent> drained = new ArrayList<>(events);
+            events.clear();
+            return drained;
+        }
     }
 
     public double getFood() {
@@ -471,5 +516,17 @@ public class EvolutionEngine {
     /** 当前时代名称（只读）。 */
     public String currentEra() {
         return ERAS[currentEraIndex];
+    }
+
+    /** 当前时代下标（只读，供存档使用）。 */
+    public int currentEraIndex() {
+        return currentEraIndex;
+    }
+
+    /** 恢复存档用：写回食物、资源与时代下标。 */
+    public void restoreState(double food, double resources, int eraIndex) {
+        this.food = Math.max(0, food);
+        this.resources = Math.max(0, resources);
+        this.currentEraIndex = Math.max(0, Math.min(ERAS.length - 1, eraIndex));
     }
 }

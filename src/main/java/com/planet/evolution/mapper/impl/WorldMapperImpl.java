@@ -50,4 +50,14 @@ public class WorldMapperImpl implements WorldMapper {
             return new ArrayList<>(events);
         }
     }
+
+    @Override
+    public void replaceEvents(List<GameEvent> replacement) {
+        synchronized (events) {
+            events.clear();
+            if (replacement != null) {
+                events.addAll(replacement);
+            }
+        }
+    }
 }

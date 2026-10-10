@@ -9,11 +9,14 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.planet.evolution.dto.RegionView;
 import com.planet.evolution.dto.WorldStateResponse;
 import com.planet.evolution.model.Civilization;
 import com.planet.evolution.model.Planet;
+import com.planet.evolution.model.Region;
 import com.planet.evolution.model.World;
 import com.planet.evolution.service.ClockService;
+import com.planet.evolution.service.SaveService;
 import com.planet.evolution.service.WorldService;
 import com.planet.evolution.simulation.EvolutionEngine;
 import com.planet.evolution.simulation.GameEvent;
@@ -34,13 +37,15 @@ public class WorldController {
     private final ClockService clockService;
     private final World world;
     private final EvolutionEngine engine;
+    private final SaveService saveService;
 
     public WorldController(WorldService worldService, ClockService clockService, World world,
-            EvolutionEngine engine) {
+            EvolutionEngine engine, SaveService saveService) {
         this.worldService = worldService;
         this.clockService = clockService;
         this.world = world;
         this.engine = engine;
+        this.saveService = saveService;
     }
 
     @GetMapping
@@ -69,6 +74,26 @@ public class WorldController {
     @GetMapping("/events")
     public List<GameEvent> getEvents() {
         return worldService.listEvents();
+    }
+
+    /** 所有区域及其归属。ownerCivId 为 0 表示无主，ownerCivName 为 null。 */
+    @GetMapping("/regions")
+    public List<RegionView> getRegions() {
+        List<RegionView> views = new ArrayList<>();
+        for (Region region : world.getRegionMap().all()) {
+            int ownerId = region.getOwnerCivId();
+            String ownerName = null;
+            if (ownerId != Region.UNOWNED) {
+                for (Civilization civilization : world.getCivilizations()) {
+                    if (civilization.getId() == ownerId) {
+                        ownerName = civilization.getName();
+                        break;
+                    }
+                }
+            }
+            views.add(new RegionView(region.getId(), region.getName(), ownerId, ownerName));
+        }
+        return views;
     }
 
     @PostMapping("/advance")
@@ -104,8 +129,18 @@ public class WorldController {
         return clockResult();
     }
 
+    /** 手动保存：把当前世界状态写入存档文件。 */
+    @PostMapping("/save")
+    public SaveResult save() {
+        String error = saveService.saveWithResult();
+        return error == null ? new SaveResult(true, null) : new SaveResult(false, error);
+    }
+
     private ClockResult clockResult() {
         return new ClockResult(clockService.isPaused(), clockService.currentSpeed());
+    }
+
+    public record SaveResult(boolean saved, String error) {
     }
 
     public record AdvanceRequest(int years) {

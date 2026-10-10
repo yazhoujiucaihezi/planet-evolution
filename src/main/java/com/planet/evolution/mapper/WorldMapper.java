@@ -21,4 +21,7 @@ public interface WorldMapper {
     boolean selectPaused();
 
     List<GameEvent> selectEvents();
+
+    /** 恢复存档用：整表替换历史事件列表。 */
+    void replaceEvents(List<GameEvent> events);
 }

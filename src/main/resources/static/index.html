@@ -14,6 +14,11 @@
   <p id="error" class="error" hidden></p>
 
   <section class="panel">
+    <h2>世界地图</h2>
+    <svg id="worldMap" viewBox="0 0 1000 500" style="width:100%;height:auto;"></svg>
+  </section>
+
+  <section class="panel">
     <h2>世界状态</h2>
     <dl class="stats">
       <dt>总人口</dt><dd id="population">-</dd>
@@ -43,8 +48,20 @@
         <input id="speed" type="number" min="1" max="100" value="1">
       </label>
       <button id="setSpeed">设置速度</button>
+      <button id="saveWorld">保存世界</button>
     </div>
     <p class="note">说明：暂停 / 恢复 / 速度目前仅设置后端状态，后端尚未实现按倍率自动推进；推进请使用上方按钮。</p>
+  </section>
+
+  <section class="panel">
+    <h2>玩家指挥</h2>
+    <div class="controls">
+      <label>用一句话下达指令
+        <input id="commandText" type="text" size="40" placeholder="例如：攻打南亚 / 发展科技 / 扩张">
+      </label>
+      <button id="sendCommand">发送</button>
+    </div>
+    <p id="commandResult" class="note">支持：attack（攻打区域）、develop_tech（发展科技）、expand（扩张）。</p>
   </section>
 
   <section class="panel">

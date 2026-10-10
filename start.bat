@@ -1,10 +1,4 @@
 @echo off
-:: 自动请求管理员权限
-net session >nul 2>&1
-if %errorlevel% neq 0 (
-    powershell -Command "Start-Process '%~f0' -Verb RunAs"
-    exit /b
-)
 rem ============================================================
 rem  星球演化模拟器 - 一键启动（前端 + 后端）
 rem  用法：双击本文件，或在命令行执行 start.bat

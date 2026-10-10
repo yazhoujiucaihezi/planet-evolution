@@ -10,7 +10,9 @@ public enum EventType {
     TECH_BREAKTHROUGH("科技突破"),
     EXTINCTION("文明灭亡"),
     /** AI 生成的历史叙事（每百年一条，稀有度固定 30，不触发大事模式）。 */
-    AI_NARRATIVE("AI叙事");
+    AI_NARRATIVE("AI叙事"),
+    /** 玩家用自然语言下达的指令。 */
+    PLAYER_COMMAND("玩家指令");
 
     private final String label;
 

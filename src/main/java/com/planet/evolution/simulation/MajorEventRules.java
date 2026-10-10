@@ -35,6 +35,7 @@ public final class MajorEventRules {
             case TECH_BREAKTHROUGH -> 35;
             case EXTINCTION -> 100;
             case AI_NARRATIVE -> 30;
+            case PLAYER_COMMAND -> 50;
         };
     }
 
@@ -77,6 +78,7 @@ public final class MajorEventRules {
             case CIVILIZATION_BIRTH -> "文明诞生：稀有度 " + civilizationBirthRarity();
             case EXTINCTION -> "文明灭亡：稀有度 " + extinctionRarity();
             case AI_NARRATIVE -> "AI叙事：固定稀有度 30（非重大事件）";
+            case PLAYER_COMMAND -> "玩家指令：普通指令 50，攻击类 70";
             case WAR -> "战争：稀有度 = 50 + |总科技 - " + WAR_TYPICAL_TECH + "| / 10 + 随机浮动(0~"
                     + WAR_RARITY_JITTER + ")";
             case DISASTER -> "灾害：稀有度 = 40 + 100 × 损失比例";
