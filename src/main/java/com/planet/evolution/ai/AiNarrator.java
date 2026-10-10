@@ -8,9 +8,9 @@ import java.util.Map;
 @Component
 public class AiNarrator {
 
-    private static final String API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions";
-    private static final String API_KEY = System.getenv("ZHIPU_API_KEY");
-    private static final String MODEL = "glm-4-flash";
+    private static final String API_URL = "https://api.siliconflow.cn/v1/chat/completions";
+    private static final String API_KEY = System.getenv("SILICONFLOW_API_KEY");
+    private static final String MODEL = "Qwen/Qwen2.5-7B-Instruct";
 
     private final RestClient client = RestClient.create();
 

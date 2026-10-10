@@ -82,21 +82,43 @@ public class ChatController {
         }
 
         String action;
-        List<Long> targetCivIds;
+        String scope;
+        String target;
         try {
             JsonNode node = parseJson(reply);
             action = node.path("action").asText("unknown").trim().toLowerCase();
-            targetCivIds = parseCivIds(node.path("targetCivIds"));
+            scope = parseScope(node.path("scope"));
+            target = node.path("target").asText("").trim();
         } catch (Exception e) {
             return new CommandResult(null, "AI 返回的内容无法解析为指令：" + e.getMessage());
         }
 
+        List<Long> targetCivIds = expandScope(scope, target, player);
+
         String result;
         switch (action) {
-            case "attack" -> result = doAttack(player, targetCivIds);
+            case "attack" -> {
+                if (targetCivIds == null || targetCivIds.isEmpty()) {
+                    result = "没听清要打谁。可以说「核平全世界」「灭了最强的」「打南亚」这类话，我再判断。";
+                } else {
+                    result = doAttack(player, targetCivIds);
+                }
+            }
+            case "nuke" -> {
+                if (targetCivIds == null || targetCivIds.isEmpty()) {
+                    result = "没听清要核平谁。可以说「核平全世界」「核平最强的」这类话，我再判断。";
+                } else {
+                    result = doNuke(player, targetCivIds);
+                }
+            }
             case "develop_tech" -> result = doDevelopTech(player);
-            case "expand" -> result = doExpand(player);
-            case "nuke" -> result = doNuke(player, targetCivIds);
+            case "expand" -> {
+                if ("ONE".equals(scope) && !target.isEmpty()) {
+                    result = doExpandTo(player, target);
+                } else {
+                    result = doExpand(player);
+                }
+            }
             default -> result = "无法理解这条指令，可以试试「发展科技」「扩张」「攻打某地」。";
         }
         return new CommandResult(result, null);
@@ -340,6 +362,26 @@ public class ChatController {
         civilization.addRegion(region.getId());
     }
 
+    /** 指定区域名扩张：精确占领玩家点名的那块接壤无主区域。 */
+    private String doExpandTo(Civilization player, String regionName) {
+        Region region = findRegionByName(regionName);
+        if (region == null) {
+            return "找不到区域「" + regionName + "」。";
+        }
+        if (!region.isUnowned()) {
+            Civilization owner = findCivilization(region.getOwnerCivId());
+            String ownerName = owner != null ? owner.getName() : "其他势力";
+            return region.getName() + " 已经被 " + ownerName + " 占了。";
+        }
+        if (!bordersPlayerTerritory(player, region)) {
+            return region.getName() + " 和你的领土不接壤，打不到。";
+        }
+        annex(player, region);
+        record(world.getYear(), EventType.PLAYER_COMMAND,
+                player.getName() + "扩张至" + region.getName(), RARITY_PEACEFUL);
+        return "你的领土扩张到了" + region.getName() + "（当前 " + player.getTerritory().size() + " 块区域）。";
+    }
+
     /** 目标区域是否与玩家现有领土接壤。 */
     private boolean bordersPlayerTerritory(Civilization player, Region target) {
         for (Integer ownedId : player.getTerritory()) {
@@ -384,26 +426,46 @@ public class ChatController {
     /** 容忍模型带 markdown 代码块或前后废话：截取第一个 { 到最后一个 }。 */
     private JsonNode parseJson(String reply) throws Exception {
         int start = reply.indexOf('{');
+        System.out.println("=== AI REPLY ===");
+        System.out.println(reply);
         int end = reply.lastIndexOf('}');
         if (start < 0 || end <= start) {
             throw new IllegalArgumentException("没有找到 JSON 对象");
         }
-        return objectMapper.readTree(reply.substring(start, end + 1));
+        String json = reply.substring(start, end + 1);
+        // 如果 JSON 不完整（缺少尾部），尝试在最后一个逗号处补齐 "]}"
+        if (!json.endsWith("]") && !json.endsWith("}")) {
+            int lastComma = json.lastIndexOf(',');
+            if (lastComma > start) {
+                json = json.substring(0, lastComma + 1) + "]";
+            }
+        }
+        return objectMapper.readTree(json);
     }
 
     /** 构造交给 AI 的翻译 prompt：玩家原话 + 完整世界状态，让模型按意图挑出文明 id。 */
     private String buildPrompt(String text, Civilization player) {
         StringBuilder prompt = new StringBuilder();
         prompt.append("你是星球演化模拟器里的指令翻译器。把玩家的一句话翻译成 JSON，只输出 JSON，不要解释，不要代码块。\n")
-                .append("格式：{\"action\":\"attack|develop_tech|expand|nuke|unknown\",\"targetCivIds\":[文明id,...],\"raw\":\"玩家原话\"}\n")
+                .append("格式：{\"action\":\"attack|nuke|expand|develop_tech|unknown\",\"scope\":\"ALL|STRONGEST|WEAKEST|NEIGHBOR|SELF|ONE|UNKNOWN\",\"target\":\"具体名字（仅 scope=ONE 时填）\",\"raw\":\"玩家原话\"}\n")
                 .append("action：attack=出兵攻打某文明；nuke=核打击某文明；expand=占领相邻无主区域；develop_tech=发展科技；unknown=看不懂。\n")
-                .append("targetCivIds 怎么填——自己看下面的世界状态判断玩家想对哪些文明动手，不要拿玩家话里的词去硬套名字：\n")
-                .append("- 「全世界」「所有人」「所有文明」→ 除玩家自己以外的全部存活文明 id\n")
-                .append("- 「最强的」「最厉害的」→ 人口最多的那个文明 id\n")
-                .append("- 「旁边的」「隔壁的」「邻居」→ 与玩家接壤的文明 id\n")
-                .append("- 「最近的敌人」「打过我的」→ 最近一次和玩家交战的文明 id（看下方最近事件）\n")
-                .append("- 玩家说了具体名字 → 世界状态里对应的那个文明 id\n")
-                .append("- 判断不出来就填 []，宁可不操作也不要乱猜；expand 和 develop_tech 不用填，填 []\n")
+                .append("scope 怎么填——AI 只输出范围标签，不再输出 id 列表，id 由后端展开：\n")
+                .append("- ALL = 全世界/所有人/所有文明/全部\n")
+                .append("- STRONGEST = 最强的/最厉害的/最大的\n")
+                .append("- WEAKEST = 最弱的/最小的\n")
+                .append("- NEIGHBOR = 旁边的/隔壁的/邻居\n")
+                .append("- ONE = 指定了具体名字，名字填在 target\n")
+                .append("- SELF = expand 和 develop_tech 用\n")
+                .append("- UNKNOWN = 看不懂\n")
+                .append("- 绝对不要输出文明 id 列表\n\n")
+                .append("target 怎么填——仅在 scope=ONE 时填，是具体的文明名字或区域名：\n")
+                .append("- attack 和 nuke 的 ONE：按名字找文明，target 填文明名\n")
+                .append("- expand 的 ONE：玩家指定了区域名（比如「占领中亚」「往南亚扩张」），target 填那个区域名\n")
+                .append("- expand 的 SELF：玩家只说「扩张」「占一块地」没指定区域名，target 留空\n")
+                .append("- develop_tech 的 SELF：表示作用于自己，target 留空\n\n")
+                .append("action：attack=出兵攻打某文明；nuke=核打击某文明；expand=占领相邻无主区域；develop_tech=发展科技；unknown=看不懂。\n")
+                .append("scope 列出的含义：ALL=全世界，STRONGEST=最强的，WEAKEST=最弱的，NEIGHBOR=旁边的/邻居，ONE=指定名字，SELF=自己，UNKNOWN=看不懂。\n")
+                .append("- 绝对不要输出文明 id 列表；AI 只负责输出 scope 和 target（当 scope=ONE 时），后端由 expandScope 展开具体 id。\n\n")
                 .append("- attack 只能打与玩家接壤的文明；nuke 需要世界总科技 ≥ 7000\n\n");
         prompt.append("世界状态：\n");
         prompt.append("- 年份：").append(world.getYear()).append('\n');
@@ -485,40 +547,118 @@ public class ChatController {
         return sb.toString();
     }
 
-    /** 解析 targetCivIds：接受 [2,3]、单个 2 或 ["2"]，去重并丢掉非法值。 */
-    private List<Long> parseCivIds(JsonNode node) {
-        List<Long> ids = new ArrayList<>();
+    /** 解析 scope 字段，默认 "UNKNOWN"，转大写。 */
+    private String parseScope(JsonNode node) {
         if (node == null || node.isMissingNode() || node.isNull()) {
-            return ids;
+            return "UNKNOWN";
         }
-        if (node.isNumber()) {
-            long single = node.asLong();
-            if (single > 0) {
-                ids.add(single);
-            }
-            return ids;
-        }
-        if (!node.isArray()) {
-            return ids;
-        }
-        for (JsonNode element : node) {
-            long id;
-            if (element.isNumber()) {
-                id = element.asLong();
-            } else if (element.isTextual()) {
-                try {
-                    id = Long.parseLong(element.asText().trim());
-                } catch (NumberFormatException e) {
-                    continue;
+        String scope = node.asText().trim().toUpperCase();
+        return scope.isEmpty() ? "UNKNOWN" : scope;
+    }
+
+    /** 按 scope 和 target 展开为文明 id 列表。 */
+    private List<Long> expandScope(String scope, String target, Civilization player) {
+        scope = scope.toUpperCase();
+        long playerId = player.getId();
+
+        switch (scope) {
+            case "ALL":
+                // 除玩家外所有存活文明 id
+                List<Long> allIds = new ArrayList<>();
+                for (Civilization civ : world.getCivilizations()) {
+                    if (civ.getId() != playerId && civ.getPopulation() > 0) {
+                        allIds.add(civ.getId());
+                    }
                 }
-            } else {
-                continue;
-            }
-            if (id > 0 && !ids.contains(id)) {
-                ids.add(id);
+                return allIds;
+
+            case "STRONGEST":
+                // 人口最多的一个（不含玩家）
+                Long strongest = null;
+                long strongestPop = -1;
+                for (Civilization civ : world.getCivilizations()) {
+                    if (civ.getId() == playerId || civ.getPopulation() <= 0) continue;
+                    if (civ.getPopulation() > strongestPop) {
+                        strongestPop = civ.getPopulation();
+                        strongest = civ.getId();
+                    }
+                }
+                return strongest != null ? List.of(strongest) : List.of();
+
+            case "WEAKEST":
+                // 人口最少的一个（不含玩家）
+                Long weakest = null;
+                long weakestPop = Long.MAX_VALUE;
+                for (Civilization civ : world.getCivilizations()) {
+                    if (civ.getId() == playerId || civ.getPopulation() <= 0) continue;
+                    if (civ.getPopulation() < weakestPop) {
+                        weakestPop = civ.getPopulation();
+                        weakest = civ.getId();
+                    }
+                }
+                return weakest != null ? List.of(weakest) : List.of();
+
+            case "NEIGHBOR":
+                // 和玩家领土接壤的所有文明 id
+                List<Long> neighborIds = new ArrayList<>();
+                Region playerRegion = null;
+                for (Integer rid : player.getTerritory()) {
+                    Region r = world.getRegionMap().get(rid);
+                    if (r != null) {
+                        playerRegion = r;
+                        break;
+                    }
+                }
+                if (playerRegion != null) {
+                    for (Civilization civ : world.getCivilizations()) {
+                        if (civ.getId() == playerId || civ.getPopulation() <= 0) continue;
+                        for (Integer rid : civ.getTerritory()) {
+                            Region r = world.getRegionMap().get(rid);
+                            if (r != null && playerRegion.getNeighbors().contains(rid)) {
+                                neighborIds.add(civ.getId());
+                                break;
+                            }
+                        }
+                    }
+                }
+                return neighborIds;
+
+            case "ONE":
+                // 按 target 找文明（先按文明名，找不到再按区域名反查归属）
+                if (target != null && !target.trim().isEmpty()) {
+                    Long found = findCivilizationByName(target.trim());
+                    if (found != null) return List.of(found);
+                }
+                // 如果 target 为空或找不到，尝试找玩家附近的文明（退回到 NEIGHBOR 行为）
+                // 这里返回空列表，让前端决定如何处理
+                return List.of();
+
+            default:
+                // UNKNOWN 或其他：返回空列表
+                return List.of();
+        }
+    }
+
+    /** 精确匹配优先，再包含匹配，跳过玩家和已灭亡文明。 */
+    private Long findCivilizationByName(String name) {
+        String wanted = name.trim();
+        // 先精确匹配
+        for (Civilization civ : world.getCivilizations()) {
+            if (civ.getId() == PLAYER_CIV_ID) continue;
+            if (civ.getPopulation() <= 0) continue;
+            if (civ.getName().equals(wanted)) {
+                return civ.getId();
             }
         }
-        return ids;
+        // 再包含匹配
+        for (Civilization civ : world.getCivilizations()) {
+            if (civ.getId() == PLAYER_CIV_ID) continue;
+            if (civ.getPopulation() <= 0) continue;
+            if (civ.getName().contains(wanted) || wanted.contains(civ.getName())) {
+                return civ.getId();
+            }
+        }
+        return null;
     }
 
     private void record(int year, EventType type, String description, int rarity) {
