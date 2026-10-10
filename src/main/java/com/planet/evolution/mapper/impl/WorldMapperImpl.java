@@ -60,4 +60,11 @@ public class WorldMapperImpl implements WorldMapper {
             }
         }
     }
+
+    @Override
+    public void clearEvents() {
+        synchronized (events) {
+            events.clear();
+        }
+    }
 }

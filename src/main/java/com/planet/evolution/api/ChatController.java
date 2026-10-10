@@ -84,11 +84,14 @@ public class ChatController {
         String action;
         String scope;
         String target;
+        String replyText;
         try {
             JsonNode node = parseJson(reply);
             action = node.path("action").asText("unknown").trim().toLowerCase();
             scope = parseScope(node.path("scope"));
             target = node.path("target").asText("").trim();
+            // 只有 action=ask 会用到 reply；其他 action 即使带了 reply 也一律忽略（下面的 switch 不读它）
+            replyText = node.path("reply").asText("").trim();
         } catch (Exception e) {
             return new CommandResult(null, "AI 返回的内容无法解析为指令：" + e.getMessage());
         }
@@ -97,6 +100,9 @@ public class ChatController {
 
         String result;
         switch (action) {
+            case "ask" -> result = replyText.isEmpty()
+                    ? "我还没想好怎么回答，换个问法再问我一次。"
+                    : replyText;
             case "attack" -> {
                 if (targetCivIds == null || targetCivIds.isEmpty()) {
                     result = "没听清要打谁。可以说「核平全世界」「灭了最强的」「打南亚」这类话，我再判断。";
@@ -115,6 +121,8 @@ public class ChatController {
             case "expand" -> {
                 if ("ONE".equals(scope) && !target.isEmpty()) {
                     result = doExpandTo(player, target);
+                } else if ("ALL".equals(scope)) {
+                    result = doExpandAll(player);
                 } else {
                     result = doExpand(player);
                 }
@@ -356,6 +364,32 @@ public class ChatController {
         return "你的领土扩张到了" + region.getName() + "（当前 " + player.getTerritory().size() + " 块区域）。";
     }
 
+    /** 一口气占掉所有能连到的无主区域：从玩家领土向外一圈圈扩散，直到没有新的可占区域。 */
+    private String doExpandAll(Civilization player) {
+        int taken = 0;
+        while (true) {
+            List<Region> batch = new ArrayList<>();
+            for (Region region : world.getRegionMap().all()) {
+                if (region.isUnowned() && bordersPlayerTerritory(player, region)) {
+                    batch.add(region);
+                }
+            }
+            if (batch.isEmpty()) {
+                break;
+            }
+            for (Region region : batch) {
+                annex(player, region);
+                taken++;
+            }
+        }
+        if (taken == 0) {
+            return "没有和你领土接壤的无主区域可以扩张。";
+        }
+        record(world.getYear(), EventType.PLAYER_COMMAND,
+                player.getName() + "一口气吞并了" + taken + "块无主区域", RARITY_PEACEFUL);
+        return "你一口气吞并了 " + taken + " 块无主区域（当前 " + player.getTerritory().size() + " 块区域）。";
+    }
+
     /** 把区域划归该文明。 */
     private void annex(Civilization civilization, Region region) {
         region.setOwnerCivId((int) civilization.getId());
@@ -447,10 +481,10 @@ public class ChatController {
     private String buildPrompt(String text, Civilization player) {
         StringBuilder prompt = new StringBuilder();
         prompt.append("你是星球演化模拟器里的指令翻译器。把玩家的一句话翻译成 JSON，只输出 JSON，不要解释，不要代码块。\n")
-                .append("格式：{\"action\":\"attack|nuke|expand|develop_tech|unknown\",\"scope\":\"ALL|STRONGEST|WEAKEST|NEIGHBOR|SELF|ONE|UNKNOWN\",\"target\":\"具体名字（仅 scope=ONE 时填）\",\"raw\":\"玩家原话\"}\n")
-                .append("action：attack=出兵攻打某文明；nuke=核打击某文明；expand=占领相邻无主区域；develop_tech=发展科技；unknown=看不懂。\n")
+                .append("格式：{\"action\":\"ask|attack|nuke|expand|develop_tech|unknown\",\"scope\":\"ALL|STRONGEST|WEAKEST|NEIGHBOR|SELF|ONE|UNKNOWN\",\"target\":\"具体名字（仅 scope=ONE 时填）\",\"reply\":\"回答内容（仅 action=ask 时填）\",\"raw\":\"玩家原话\"}\n")
+                .append("action：ask=玩家在问问题，你在 reply 里直接回答；attack=出兵攻打某文明；nuke=核打击某文明；expand=占领相邻无主区域；develop_tech=发展科技；unknown=看不懂。\n")
                 .append("scope 怎么填——AI 只输出范围标签，不再输出 id 列表，id 由后端展开：\n")
-                .append("- ALL = 全世界/所有人/所有文明/全部\n")
+                .append("- ALL = 全世界/所有人/所有文明/全部（expand 时指所有能连到的无主区域）\n")
                 .append("- STRONGEST = 最强的/最厉害的/最大的\n")
                 .append("- WEAKEST = 最弱的/最小的\n")
                 .append("- NEIGHBOR = 旁边的/隔壁的/邻居\n")
@@ -460,13 +494,21 @@ public class ChatController {
                 .append("- 绝对不要输出文明 id 列表\n\n")
                 .append("target 怎么填——仅在 scope=ONE 时填，是具体的文明名字或区域名：\n")
                 .append("- attack 和 nuke 的 ONE：按名字找文明，target 填文明名\n")
+                .append("- expand 的 ALL：玩家说「占领全世界」「占领所有无主区域」「占满」「都占了」→ scope=ALL，target 留空，后端会把所有和领土连得上的无主区域一次占完\n")
                 .append("- expand 的 ONE：玩家指定了区域名（比如「占领中亚」「往南亚扩张」），target 填那个区域名\n")
                 .append("- expand 的 SELF：玩家只说「扩张」「占一块地」没指定区域名，target 留空\n")
                 .append("- develop_tech 的 SELF：表示作用于自己，target 留空\n\n")
                 .append("action：attack=出兵攻打某文明；nuke=核打击某文明；expand=占领相邻无主区域；develop_tech=发展科技；unknown=看不懂。\n")
                 .append("scope 列出的含义：ALL=全世界，STRONGEST=最强的，WEAKEST=最弱的，NEIGHBOR=旁边的/邻居，ONE=指定名字，SELF=自己，UNKNOWN=看不懂。\n")
                 .append("- 绝对不要输出文明 id 列表；AI 只负责输出 scope 和 target（当 scope=ONE 时），后端由 expandScope 展开具体 id。\n\n")
-                .append("- attack 只能打与玩家接壤的文明；nuke 需要世界总科技 ≥ 7000\n\n");
+                .append("- attack 只能打与玩家接壤的文明；nuke 需要世界总科技 ≥ 7000\n\n")
+                .append("action=ask：玩家在问问题、而不是下命令时用它，回答写在 reply 字段里：\n")
+                .append("- 问情况 / 问建议 / 问会发生什么（「现在世界怎么样」「哪个文明最强」「我该怎么办」「打他会不会赢」）→ action=ask，reply 里直接写出给玩家的回答\n")
+                .append("- 疑问词（吗 / 呢 / 怎么 / 为什么 / 哪 / 谁 / 什么 / 会不会 / 怎么样）→ 大概率是 ask\n")
+                .append("- 动词开头、祈使句（打 / 核 / 占 / 发展 / 灭了 / 扩张）→ 大概率是命令，按 scope/target 格式输出\n")
+                .append("- 拿不准的时候优先当 ask，不要瞎执行操作\n")
+                .append("- ask 的 reply 用中文写给人看，可以引用上面的世界状态；不要在 reply 里再嵌 JSON，也不要解释格式；ask 时 scope/target 留空或 UNKNOWN 即可，后端不会执行任何动作\n")
+                .append("- 所有统计类问题（还剩几个文明、总人口多少、世界总科技多少）直接用世界状态里给出的数字回答，不要自己数、不要估算\n\n");
         prompt.append("世界状态：\n");
         prompt.append("- 年份：").append(world.getYear()).append('\n');
         prompt.append("- 玩家（下指令的人）：id=").append(player.getId())
@@ -477,6 +519,9 @@ public class ChatController {
         prompt.append("- 可扩张的相邻无主区域：").append(describeExpandable(player)).append('\n');
         prompt.append("- 世界总科技：").append(worldTech())
                 .append("（核子时代门槛 ").append(NUKE_TECH_REQUIRED).append("）\n");
+        prompt.append("- 存活文明总数：").append(aliveCivCountExcludingPlayer(player))
+                .append("（不含玩家，人口>0）\n");
+        prompt.append("- 世界总人口：").append(totalPopulation()).append('\n');
         prompt.append("- 存活文明：\n").append(describeCivs(player));
         prompt.append("- 最近事件（最新在前）：\n").append(describeRecentEvents());
         prompt.append('\n').append("玩家原话：").append(text);
@@ -510,6 +555,28 @@ public class ChatController {
     /** 世界总科技：各文明科技之和，口径与 EvolutionEngine.totalTech() 一致。 */
     private int worldTech() {
         return world.getCivilizations().stream().mapToInt(Civilization::getTechLevel).sum();
+    }
+
+    /** 存活文明总数（不含玩家，只算人口 > 0 的）。 */
+    private int aliveCivCountExcludingPlayer(Civilization player) {
+        int count = 0;
+        for (Civilization civilization : world.getCivilizations()) {
+            if (civilization.getId() != player.getId() && civilization.getPopulation() > 0) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /** 世界总人口（含玩家，只算存活文明）。 */
+    private long totalPopulation() {
+        long total = 0;
+        for (Civilization civilization : world.getCivilizations()) {
+            if (civilization.getPopulation() > 0) {
+                total += civilization.getPopulation();
+            }
+        }
+        return total;
     }
 
     /** 存活文明清单：id / 名称 / 人口 / 科技 / 占地块数 / 与玩家关系。 */

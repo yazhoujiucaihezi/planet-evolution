@@ -25,7 +25,7 @@ public class AiNarrator {
                     "role", "user",
                     "content", eventSummary
                 )),
-                "max_tokens", 200
+                "max_tokens", 1500
             );
 
             Map<?, ?> resp = client.post()

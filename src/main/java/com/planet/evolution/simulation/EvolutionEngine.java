@@ -3,14 +3,19 @@ package com.planet.evolution.simulation;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Queue;
 import java.util.Random;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 import org.springframework.beans.factory.annotation.Autowired;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.planet.evolution.ai.AiNarrator;
 import com.planet.evolution.ai.NarrativeExecutor;
 import com.planet.evolution.mapper.WorldMapper;
 import com.planet.evolution.model.Civilization;
+import com.planet.evolution.model.Region;
 import com.planet.evolution.model.World;
 
 /**
@@ -42,6 +47,24 @@ public class EvolutionEngine {
     /** AI 叙事的固定稀有度：低于重大阈值 60，不触发大事模式、不高亮。 */
     private static final int AI_NARRATIVE_RARITY = 30;
     private static final double BASE_CAPACITY = 500_000;
+
+    /** 玩家文明固定为 id = 1，不参与 AI 决策（与 ChatController 一致）。 */
+    private static final long PLAYER_CIV_ID = 1L;
+    /** AI 世界演化的周期：每 20 年一次。 */
+    private static final int AI_TICK_INTERVAL = 20;
+    /** AI 世界事件/决策的稀有度（>= 60，属重大事件）。 */
+    private static final int AI_EVENT_RARITY = 70;
+    /** civDecisions 里「发展科技」没给 effects.tech 时的默认科技增益。 */
+    private static final int AI_DECISION_TECH_GAIN = 50;
+    /** AI 效果的数值上限：模型偶尔会给离谱数字，兜一下免得把模拟搞崩。 */
+    private static final long AI_EFFECT_LIMIT = 1_000_000L;
+    /** 规则事件降频系数：AI 接管演化后，灾难/战争/科技突破只作兜底（灾难 2% → 0.5%）。 */
+    private static final double FALLBACK_EVENT_FACTOR = 0.25;
+    /** 世界初始状态：与 WorldConfig 的 new Planet("盖亚", 15.0, 1.0) 及构造函数初值保持一致。 */
+    private static final double INITIAL_FOOD = 600.0;
+    private static final double INITIAL_RESOURCES = 400.0;
+    private static final double INITIAL_TEMPERATURE = 15.0;
+    private static final double INITIAL_HABITABILITY = 1.0;
 
     /** 时代名称，与 ERA_THRESHOLDS 一一对应。 */
     private static final String[] ERAS = {
@@ -83,6 +106,15 @@ public class EvolutionEngine {
     // AI 叙事异步执行器：提交后立即返回，不阻塞 tick
     @Autowired
     private NarrativeExecutor narrativeExecutor;
+    // 解析 AI 返回的演化 JSON（离线测试没有注入时为 null，直接跳过 AI 演化）
+    @Autowired
+    private ObjectMapper objectMapper;
+
+    /**
+     * AI 回复的落脚点：AI 线程只做网络调用并把原文入队，
+     * 世界改动统一由 tick 线程在 {@link #applyPendingAiReplies()} 里执行，避免两边同时改文明。
+     */
+    private final Queue<String> pendingAiReplies = new ConcurrentLinkedQueue<>();
 
     private final World world;
     private final PlanetProfile profile;
@@ -103,8 +135,8 @@ public class EvolutionEngine {
         this.world = world;
         this.profile = profile;
         this.random = new Random(seed);
-        this.food = 600.0;
-        this.resources = 400.0;
+        this.food = INITIAL_FOOD;
+        this.resources = INITIAL_RESOURCES;
     }
 
     /** 设置是否启用 AI 叙事。 */
@@ -114,6 +146,8 @@ public class EvolutionEngine {
 
     /** 推进一年。 */
     public void tick() {
+        // 先把上一次 AI 演化请求的结果落地：世界状态只在 tick 线程上改
+        applyPendingAiReplies();
         produce();
         int year = world.getYear();
         // 先产粮、再消耗，最后按当年真实粮食结余决定人口增减
@@ -127,6 +161,10 @@ public class EvolutionEngine {
         world.tick();
         if (world.getYear() % 100 == 0 && world.getYear() > 0) {
             narrateCentury();
+        }
+        // 每 20 年让 AI 驱动一次世界演化（世界事件 + 各文明决策）
+        if (world.getYear() > 0 && world.getYear() % AI_TICK_INTERVAL == 0) {
+            aiTick();
         }
         checkEraPromotion();
     }
@@ -219,6 +257,385 @@ public class EvolutionEngine {
             // 直接写 mapper，保证前端立即可见（不依赖后续 tick 的 drainEvents）
             worldMapper.insertEvent(new GameEvent(storyYear, EventType.AI_NARRATIVE, story, AI_NARRATIVE_RARITY));
         });
+    }
+
+    // ==================== AI 世界演化（每 20 年一次） ====================
+
+    /**
+     * AI 世界演化：一次请求同时产出「世界事件」和「各文明决策」。
+     * 这里只在 tick 线程上同步拼 prompt 并提交异步任务；AI 的回复由
+     * {@link #applyPendingAiReplies()} 在后续 tick 上落地，
+     * 于是世界状态永远只被 tick 线程修改（AI 线程只做网络调用 + 入队）。
+     */
+    private void aiTick() {
+        // 长推进（>100 年）时与现有 AI 叙事一样关掉，否则几百个请求会堆在队列里
+        if (!narrateEnabled) {
+            return;
+        }
+        // 直接 new 构造的引擎（离线测试）没有 Spring 注入，跳过 AI 演化
+        if (aiNarrator == null || narrativeExecutor == null || worldMapper == null || objectMapper == null) {
+            return;
+        }
+        final String prompt = buildAiTickPrompt();
+        narrativeExecutor.submit(() -> {
+            String reply = aiNarrator.narrate(prompt);
+            if (reply != null) {
+                // 只入队，绝不在这里碰世界状态
+                pendingAiReplies.add(reply);
+            }
+        });
+    }
+
+    /** 拼 prompt：所有存活文明 + 最近 20 年事件 + 当前时代，一次要回世界事件和各文明决策。 */
+    private String buildAiTickPrompt() {
+        int year = world.getYear();
+        StringBuilder prompt = new StringBuilder();
+        prompt.append("你是星球演化模拟器的世界导演。根据下面的世界状态，一次性输出两部分内容：\n")
+                .append("1) worldEvents：接下来 20 年发生的 1~3 条世界事件（天灾、发现、思潮、战争等）\n")
+                .append("2) civDecisions：每个非玩家文明在这 20 年里的一个决策\n")
+                .append("只输出 JSON，不要解释，不要代码块。格式：\n")
+                .append("{\"worldEvents\":[{\"name\":\"事件名\",\"description\":\"发生了什么\",")
+                .append("\"affectedCivIds\":[2,3],\"effects\":{\"tech\":50,\"population\":-1000,\"resources\":2000}}],")
+                .append("\"civDecisions\":[{\"civId\":2,\"decision\":\"发展科技\",\"effects\":{\"tech\":50}},")
+                .append("{\"civId\":3,\"decision\":\"攻打文明-5\",\"targetCivId\":5},")
+                .append("{\"civId\":4,\"decision\":\"扩张\"}]}\n")
+                .append("- effects.tech=科技增减、effects.population=人口增减（作用于 affectedCivIds 里每个文明），")
+                .append("effects.resources=全球资源增减；都可以为负，也可以省略\n")
+                .append("- civDecisions 的 decision 只允许这三种：\"发展科技\"、\"扩张\"、\"攻打文明X\"（攻打必须给 targetCivId）\n")
+                .append("- 玩家文明（id=").append(PLAYER_CIV_ID).append("）不参与决策，不要给它写 civDecisions\n")
+                .append("- affectedCivIds 和 targetCivId 只能用下面列出的存活文明 id，不要编造\n\n");
+        prompt.append("世界状态：\n");
+        prompt.append("- 当前年份：").append(year).append('\n');
+        prompt.append("- 当前时代：").append(ERAS[currentEraIndex]).append('\n');
+        prompt.append("- 全球资源存量：").append(Math.round(resources)).append('\n');
+        prompt.append("- 存活文明：\n");
+        for (Civilization civilization : world.getCivilizations()) {
+            if (civilization.getPopulation() <= 0) {
+                continue;
+            }
+            prompt.append("  id=").append(civilization.getId())
+                    .append("，名称=").append(civilization.getName())
+                    .append("，人口=").append(civilization.getPopulation())
+                    .append("，科技=").append(civilization.getTechLevel())
+                    .append("，领土=").append(civilization.getTerritory().size()).append("块")
+                    .append(civilization.getId() == PLAYER_CIV_ID ? "（玩家，不参与决策）" : "")
+                    .append('\n');
+        }
+        prompt.append("- 最近 ").append(AI_TICK_INTERVAL).append(" 年的事件：\n");
+        boolean hasEvent = false;
+        for (GameEvent event : worldMapper.selectEvents()) {
+            // 与百年叙事一致：不拿 AI 叙事当素材，避免自我引用
+            if (event.year() < year - AI_TICK_INTERVAL || event.year() > year
+                    || event.type() == EventType.AI_NARRATIVE) {
+                continue;
+            }
+            prompt.append("  [").append(event.year()).append("年] ").append(event.description()).append('\n');
+            hasEvent = true;
+        }
+        if (!hasEvent) {
+            prompt.append("  （无）\n");
+        }
+        return prompt.toString();
+    }
+
+    /** 落地所有已到达的 AI 回复；只在 tick 线程调用，单条出错不影响其他条目。 */
+    private void applyPendingAiReplies() {
+        String reply;
+        while ((reply = pendingAiReplies.poll()) != null) {
+            try {
+                applyAiReply(reply);
+            } catch (Exception e) {
+                System.out.println("[AI演化] 回复无法处理，已跳过：" + e.getMessage());
+            }
+        }
+    }
+
+    private void applyAiReply(String reply) throws Exception {
+        JsonNode root = parseJsonObject(reply);
+        int year = world.getYear();
+        JsonNode worldEvents = root.path("worldEvents");
+        if (worldEvents.isArray()) {
+            for (JsonNode event : worldEvents) {
+                applyWorldEvent(year, event);
+            }
+        }
+        JsonNode civDecisions = root.path("civDecisions");
+        if (civDecisions.isArray()) {
+            for (JsonNode decision : civDecisions) {
+                applyCivDecision(year, decision);
+            }
+        }
+    }
+
+    /** 容忍模型带 markdown 代码块或前后废话：截取第一个 { 到最后一个 }。 */
+    private JsonNode parseJsonObject(String reply) throws Exception {
+        int start = reply.indexOf('{');
+        int end = reply.lastIndexOf('}');
+        if (start < 0 || end <= start) {
+            throw new IllegalArgumentException("没有找到 JSON 对象");
+        }
+        return objectMapper.readTree(reply.substring(start, end + 1));
+    }
+
+    /** 一条世界事件：按 affectedCivIds 套 effects，再写一条 AI_EVENT。 */
+    private void applyWorldEvent(int year, JsonNode event) {
+        String name = event.path("name").asText("").trim();
+        String description = event.path("description").asText("").trim();
+        String text = name.isEmpty() ? description
+                : (description.isEmpty() ? name : name + "：" + description);
+        if (text.isEmpty()) {
+            return;
+        }
+        JsonNode effects = event.path("effects");
+        long populationDelta = clamp(effects.path("population").asLong(0), -AI_EFFECT_LIMIT, AI_EFFECT_LIMIT);
+        int techDelta = (int) clamp(effects.path("tech").asLong(0), -AI_EFFECT_LIMIT, AI_EFFECT_LIMIT);
+        double resourceDelta = clamp(effects.path("resources").asDouble(0), -AI_EFFECT_LIMIT, AI_EFFECT_LIMIT);
+        JsonNode affected = event.path("affectedCivIds");
+        if (affected.isArray()) {
+            for (JsonNode idNode : affected) {
+                Civilization civilization = findCivilization(idNode.asLong(-1));
+                if (civilization != null && civilization.getPopulation() > 0) {
+                    applyEffects(year, civilization, populationDelta, techDelta);
+                }
+            }
+        }
+        // 资源是全球池，一条事件只扣/加一次
+        if (resourceDelta != 0) {
+            resources = clamp(resources + resourceDelta, 0, MAX_STOCK);
+        }
+        record(year, EventType.AI_EVENT, text, AI_EVENT_RARITY);
+    }
+
+    /** 一条文明决策：发展科技 / 扩张 / 攻打 走专门逻辑，其他按 effects 改数值。 */
+    private void applyCivDecision(int year, JsonNode decision) {
+        Civilization civilization = findCivilization(decision.path("civId").asLong(-1));
+        // 玩家文明不参与 AI 决策；已灭亡的文明也不再行动
+        if (civilization == null || civilization.getId() == PLAYER_CIV_ID
+                || civilization.getPopulation() <= 0) {
+            return;
+        }
+        String text = decision.path("decision").asText("").trim();
+        JsonNode effects = decision.path("effects");
+        if (text.contains("攻打") || text.contains("进攻")) {
+            aiAttack(year, civilization, decision);
+            return;
+        }
+        if (text.contains("扩张") || text.contains("占领")) {
+            record(year, EventType.AI_EVENT, civilization.getName() + "选择扩张" + expandOne(civilization),
+                    AI_EVENT_RARITY);
+            return;
+        }
+        if (text.contains("科技")) {
+            int gain = (int) clamp(effects.path("tech").asLong(AI_DECISION_TECH_GAIN),
+                    -AI_EFFECT_LIMIT, AI_EFFECT_LIMIT);
+            applyEffects(year, civilization, 0, gain);
+            record(year, EventType.AI_EVENT, civilization.getName() + "选择发展科技（科技 +" + gain + "）",
+                    AI_EVENT_RARITY);
+            return;
+        }
+        applyEffects(year, civilization,
+                clamp(effects.path("population").asLong(0), -AI_EFFECT_LIMIT, AI_EFFECT_LIMIT),
+                (int) clamp(effects.path("tech").asLong(0), -AI_EFFECT_LIMIT, AI_EFFECT_LIMIT));
+        record(year, EventType.AI_EVENT, civilization.getName() + "的决策：" + (text.isEmpty() ? "调整" : text),
+                AI_EVENT_RARITY);
+    }
+
+    /** 给单个文明套科技/人口增减；人口跌破灭绝线按灭亡处理（与规则事件同口径）。 */
+    private void applyEffects(int year, Civilization civilization, long populationDelta, int techDelta) {
+        if (techDelta != 0) {
+            civilization.setTechLevel(
+                    (int) clamp(civilization.getTechLevel() + (long) techDelta, 0, AI_EFFECT_LIMIT));
+        }
+        if (populationDelta == 0) {
+            return;
+        }
+        long next = civilization.getPopulation() + populationDelta;
+        if (next < profile.extinctionPopulation()) {
+            record(year, EventType.EXTINCTION, civilization.getName() + "人口凋零，文明灭亡",
+                    MajorEventRules.extinctionRarity());
+            civilization.setPopulation(0L);
+            return;
+        }
+        civilization.setPopulation(Math.min(MAX_POPULATION, next));
+    }
+
+    /** AI 决策「攻打」：复用现有战争损失逻辑 applyWarLoss 与 WAR 事件口径。 */
+    private void aiAttack(int year, Civilization attacker, JsonNode decision) {
+        Civilization target = findCivilization(decision.path("targetCivId").asLong(-1));
+        if (target == null) {
+            // targetCivId 缺失时退回从决策文本里找文明名（例如「攻打文明-5」）
+            target = findByDecisionText(decision.path("decision").asText(""));
+        }
+        if (target == null || target.getId() == attacker.getId() || target.getPopulation() <= 0) {
+            record(year, EventType.AI_EVENT, attacker.getName() + "想动武，但没找到目标", AI_EVENT_RARITY);
+            return;
+        }
+        double severity = 0.05 + random.nextDouble() * 0.2;
+        applyWarLoss(year, attacker, Math.round(attacker.getPopulation() * severity));
+        applyWarLoss(year, target, Math.round(target.getPopulation() * severity));
+        resources = Math.max(0, resources * 0.85);
+        int jitter = random.nextInt(MajorEventRules.WAR_RARITY_JITTER + 1);
+        record(year, EventType.WAR, attacker.getName() + "攻打" + target.getName() + "，双方损失人口约"
+                + Math.round(severity * 100) + "%", MajorEventRules.warRarity(totalTech(), jitter));
+    }
+
+    /** 占一块与该文明接壤的无主区域，返回拼事件描述用的后缀。 */
+    private String expandOne(Civilization civilization) {
+        for (Region region : world.getRegionMap().all()) {
+            if (region.isUnowned() && borders(civilization, region)) {
+                region.setOwnerCivId((int) civilization.getId());
+                civilization.addRegion(region.getId());
+                return "至" + region.getName();
+            }
+        }
+        return "，但没有接壤的无主区域";
+    }
+
+    /** 目标区域是否与该文明现有领土接壤。 */
+    private boolean borders(Civilization civilization, Region target) {
+        for (Integer ownedId : civilization.getTerritory()) {
+            if (target.getNeighbors().contains(ownedId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 从决策文本里认文明名（"攻打文明-5" 这种），作为 targetCivId 缺失时的兜底。 */
+    private Civilization findByDecisionText(String text) {
+        if (text == null || text.isBlank()) {
+            return null;
+        }
+        for (Civilization civilization : world.getCivilizations()) {
+            if (civilization.getPopulation() > 0 && text.contains(civilization.getName())) {
+                return civilization;
+            }
+        }
+        return null;
+    }
+
+    private Civilization findCivilization(long id) {
+        for (Civilization civilization : world.getCivilizations()) {
+            if (civilization.getId() == id) {
+                return civilization;
+            }
+        }
+        return null;
+    }
+
+    private static long clamp(long value, long min, long max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    private static double clamp(double value, double min, double max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    // ==================== 跳过时代（单人直接执行，不投票） ====================
+
+    /** 跳过时代一次最多跨几个时代。 */
+    public static final int MAX_ERA_SKIP_STEPS = 5;
+
+    /**
+     * 跳过当前时代：把科技、人口、食物、资源按目标时代的门槛比例整体放大。
+     * 合法性：targetEraIndex 必须晚于当前时代、最多跨 {@link #MAX_ERA_SKIP_STEPS} 个时代、且小于 ERAS.length。
+     * 缩放比例 = ERA_THRESHOLDS[target] / ERA_THRESHOLDS[current]；
+     * 蒙昧时代门槛是 0，比例无从计算，此时取 1（只推时代，不放大数值）。
+     *
+     * @return 成功时返回一段描述文字；失败时返回错误信息
+     */
+    public synchronized String skipEra(int targetEraIndex) {
+        if (targetEraIndex >= ERAS.length) {
+            return "目标时代不存在（最大是 " + ERAS[ERAS.length - 1] + "，下标 " + (ERAS.length - 1) + "）";
+        }
+        if (targetEraIndex <= currentEraIndex) {
+            return "目标时代必须晚于当前时代（当前：" + ERAS[currentEraIndex] + "）";
+        }
+        if (targetEraIndex > currentEraIndex + MAX_ERA_SKIP_STEPS) {
+            return "一次最多跳 " + MAX_ERA_SKIP_STEPS + " 个时代（当前 " + ERAS[currentEraIndex]
+                    + "，最远只能到 " + ERAS[Math.min(ERAS.length - 1, currentEraIndex + MAX_ERA_SKIP_STEPS)]
+                    + "）";
+        }
+
+        String fromEra = ERAS[currentEraIndex];
+        String toEra = ERAS[targetEraIndex];
+        double fromThreshold = ERA_THRESHOLDS[currentEraIndex];
+        double scale = fromThreshold <= 0 ? 1.0 : ERA_THRESHOLDS[targetEraIndex] / fromThreshold;
+
+        for (Civilization civilization : world.getCivilizations()) {
+            if (civilization.getPopulation() <= 0) {
+                continue;
+            }
+            long tech = Math.round(civilization.getTechLevel() * scale);
+            civilization.setTechLevel((int) Math.min(Integer.MAX_VALUE, tech));
+            long population = Math.round(civilization.getPopulation() * scale);
+            civilization.setPopulation(Math.min(MAX_POPULATION, population));
+        }
+        food = Math.min(MAX_STOCK, food * scale);
+        resources = Math.min(MAX_STOCK, resources * scale);
+        currentEraIndex = targetEraIndex;
+
+        narrateEraSkip(fromEra, toEra, scale);
+        return "文明跨过漫长岁月，从" + fromEra + "进入了" + toEra
+                + "（科技与人口 ×" + String.format("%.2f", scale) + "）";
+    }
+
+    /** 异步让 AI 写一段「时代跨越」叙事，作为 AI_NARRATIVE 事件写入历史（稀有度 80）。 */
+    private void narrateEraSkip(String fromEra, String toEra, double scale) {
+        // 直接 new 构造的引擎（离线测试）没有注入，跳过
+        if (aiNarrator == null || worldMapper == null || narrativeExecutor == null) {
+            return;
+        }
+        final int storyYear = world.getYear();
+        final String prompt = "星球整体跨过了一段漫长岁月，从" + fromEra + "直接进入了" + toEra
+                + "（科技与人口规模约 ×" + String.format("%.2f", scale)
+                + "）。请写一段 100 字左右的历史叙事，描述这段被跨越的岁月里发生了什么，"
+                + "风格像《银河系漫游指南》，只写叙事，不要分析，不要解释。";
+        narrativeExecutor.submit(() -> {
+            String story = aiNarrator.narrate(prompt);
+            if (story != null) {
+                System.out.println("[时代跨越] " + fromEra + " → " + toEra + "：" + story);
+                // 与时代晋升一致：直接写 mapper，保证前端立即可见
+                worldMapper.insertEvent(new GameEvent(storyYear, EventType.AI_NARRATIVE, story, 80));
+            }
+        });
+    }
+
+    // ==================== 新游戏（清空世界，从零开始） ====================
+
+    /**
+     * 新游戏：清空文明与历史事件、区域全部回到无主，年份/时代/食物/资源/星球参数都恢复初始值，
+     * 然后按 WorldConfig 的做法重新生成 1 个「人类」文明。
+     *
+     * @return 给前端显示的提示文字
+     */
+    public synchronized String resetWorld() {
+        // 文明与区域归属：clearCivilizations() 内部会同时把所有区域置为无主
+        world.clearCivilizations();
+        world.setYear(0);
+        currentEraIndex = 0;
+        food = INITIAL_FOOD;
+        resources = INITIAL_RESOURCES;
+        lastFoodProduction = 0;
+        foodBalance = 0;
+        foodRatio = 1.0;
+        // 星球参数回到 WorldConfig 里的初始值（星球名不动）
+        world.getPlanet().setTemperature(INITIAL_TEMPERATURE);
+        world.getPlanet().setHabitability(INITIAL_HABITABILITY);
+        // 历史事件：引擎缓冲区与世界存储都清空
+        synchronized (events) {
+            events.clear();
+        }
+        if (worldMapper != null) {
+            worldMapper.clearEvents();
+        }
+        // 上一局残留的 AI 回复不能再落到新世界上
+        pendingAiReplies.clear();
+        // 文明 id 计数与命名计数一并归零：重开后的「人类」必须还是 id=1（玩家文明）
+        nextCivilizationId = 1;
+        world.resetCivilizationIdCounter();
+        world.spawnCivilization("人类");
+        return "世界已重置，从第 0 年开始。";
     }
 
     private void produce() {
@@ -330,7 +747,8 @@ public class EvolutionEngine {
     }
 
     private void checkDisaster(int year) {
-        if (random.nextDouble() >= profile.disasterChance()) {
+        // AI 每 20 年接管演化后，规则灾难只作兜底：概率打折（类地星球 2% → 0.5%）
+        if (random.nextDouble() >= profile.disasterChance() * FALLBACK_EVENT_FACTOR) {
             return;
         }
         Civilization civilization = randomAliveCivilization();
@@ -363,7 +781,8 @@ public class EvolutionEngine {
         if (aliveCount < 2 || totalTech() < profile.warTechThreshold()) {
             return;
         }
-        if (random.nextDouble() >= 0.04) {
+        // 规则战争同样降频，AI 决策里的「攻打」才是主要来源
+        if (random.nextDouble() >= 0.04 * FALLBACK_EVENT_FACTOR) {
             return;
         }
         Civilization a = randomAliveCivilization();
@@ -401,7 +820,8 @@ public class EvolutionEngine {
     }
 
     private void checkTechBreakthrough(int year) {
-        if (random.nextDouble() >= 0.03) {
+        // 规则科技突破同样降频，作为 AI 演化之外的兜底
+        if (random.nextDouble() >= 0.03 * FALLBACK_EVENT_FACTOR) {
             return;
         }
         Civilization civilization = randomAliveCivilization();
@@ -521,6 +941,11 @@ public class EvolutionEngine {
     /** 当前时代下标（只读，供存档使用）。 */
     public int currentEraIndex() {
         return currentEraIndex;
+    }
+
+    /** 全部时代名称（只读副本），供前端列可选时代用。 */
+    public String[] eras() {
+        return ERAS.clone();
     }
 
     /** 恢复存档用：写回食物、资源与时代下标。 */

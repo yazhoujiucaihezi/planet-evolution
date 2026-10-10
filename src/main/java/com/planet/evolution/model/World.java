@@ -100,6 +100,11 @@ public class World {
         }
     }
 
+    /** 新游戏用：把文明 id 计数归零，让重开后的第一个文明仍然是 id=1（玩家文明）。 */
+    public void resetCivilizationIdCounter() {
+        nextCivilizationId = 1;
+    }
+
     /** 恢复存档用：按原样放回一个文明（保留 id、诞生年、人口、科技、领土）与区域归属。 */
     public void restoreCivilization(Civilization civilization) {
         civilizations.add(civilization);

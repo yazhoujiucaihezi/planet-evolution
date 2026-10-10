@@ -13,6 +13,7 @@ const RARITY_LABELS = {
   TECH_BREAKTHROUGH: '科技突破',
   EXTINCTION: '文明灭亡',
   AI_NARRATIVE: 'AI叙事',
+  AI_EVENT: '世界事件',
 };
 
 const $ = (id) => document.getElementById(id);
@@ -26,7 +27,7 @@ function showError(message) {
 // 轻量提示：复用底部提示条，2 秒后自动消失
 let noticeTimer = null;
 
-function showNotice(message) {
+function showNotice(message, durationMs = 2000) {
   showError(message);
   if (noticeTimer !== null) {
     clearTimeout(noticeTimer);
@@ -34,7 +35,7 @@ function showNotice(message) {
   noticeTimer = setTimeout(() => {
     noticeTimer = null;
     showError('');
-  }, 2000);
+  }, durationMs);
 }
 
 function num(value) {
@@ -317,8 +318,39 @@ async function advanceYears() {
   }
 }
 
+// 跳过时代：可选目标由后端算（当前时代之后最多 5 个），前端只负责让用户选一个
+async function skipEra() {
+  const options = await api('/api/world/eras');
+  const targets = (options && options.targets) || [];
+  if (targets.length === 0) {
+    showError('已经是最后一个时代，没有可跳的目标。');
+    return;
+  }
+  const list = targets.map((t, i) => `${i + 1}. ${t.name}`).join('\n');
+  const answer = prompt(`当前时代：${options.currentEra}\n\n跳到哪个时代？输入序号：\n${list}`, '1');
+  if (answer === null) {
+    return;
+  }
+  const chosen = targets[Number(answer.trim()) - 1];
+  if (!chosen) {
+    showError('没有这个序号，已取消。');
+    return;
+  }
+  if (!confirm(`确定跳到「${chosen.name}」？科技、人口、食物、资源都会按时代比例整体放大。`)) {
+    return;
+  }
+  const result = await post('/api/world/skip-era', { targetEraIndex: chosen.index });
+  if (result && result.result) {
+    showNotice(result.result, 6000);
+  } else {
+    showError('跳过时代失败：' + ((result && result.error) || '未知错误'));
+  }
+}
+
 function bind() {
   $('advance').addEventListener('click', () => run(advanceYears));
+
+  $('skipEra').addEventListener('click', () => run(skipEra));
 
   $('runToMajor').addEventListener('click', () => run(async () => {
     const result = await post('/api/world/run-to-major', { maxYears: 5000 });
@@ -343,6 +375,19 @@ function bind() {
     } else {
       showError('保存失败：' + ((result && result.error) || '未知错误'));
     }
+  }));
+
+  // 新游戏：清空世界从零开始（不可恢复，先确认）
+  $('newGame').addEventListener('click', () => run(async () => {
+    if (!confirm('确定要重开吗？当前世界会被清空，无法恢复。')) {
+      return;
+    }
+    const result = await post('/api/world/new-game');
+    if (result && result.error) {
+      showError('世界已重置，但存档写入失败：' + result.error);
+      return;
+    }
+    showNotice(result && result.result ? result.result : '世界已重置。', 6000);
   }));
 
   const sendCommand = () => run(async () => {

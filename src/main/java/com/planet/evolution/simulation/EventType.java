@@ -11,6 +11,8 @@ public enum EventType {
     EXTINCTION("文明灭亡"),
     /** AI 生成的历史叙事（每百年一条，稀有度固定 30，不触发大事模式）。 */
     AI_NARRATIVE("AI叙事"),
+    /** AI 每 20 年驱动世界演化时生成的世界事件。 */
+    AI_EVENT("世界事件"),
     /** 玩家用自然语言下达的指令。 */
     PLAYER_COMMAND("玩家指令");
 

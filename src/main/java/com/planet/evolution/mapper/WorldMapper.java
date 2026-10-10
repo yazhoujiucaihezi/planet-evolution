@@ -24,4 +24,7 @@ public interface WorldMapper {
 
     /** 恢复存档用：整表替换历史事件列表。 */
     void replaceEvents(List<GameEvent> events);
+
+    /** 新游戏用：清空历史事件。 */
+    void clearEvents();
 }

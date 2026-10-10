@@ -32,6 +32,8 @@ public class WorldController {
     private static final int DEFAULT_MAJOR_YEARS = 5000;
     /** 大事模式最大搜索年限，避免无限循环。 */
     private static final int MAX_MAJOR_YEARS = 50000;
+    /** 跳过时代一次最多跨几个时代（与 EvolutionEngine.skipEra 的校验一致）。 */
+    private static final int SKIP_ERA_MAX_STEPS = 5;
 
     private final WorldService worldService;
     private final ClockService clockService;
@@ -111,6 +113,45 @@ public class WorldController {
         return MajorResult.of(worldService.advanceToNextMajorEvent(maxYears));
     }
 
+    /** 跳过时代用：当前时代 + 可选的目标时代（最多跨 SKIP_ERA_MAX_STEPS 个）。 */
+    @GetMapping("/eras")
+    public EraOptions eras() {
+        int current = engine.currentEraIndex();
+        String[] names = engine.eras();
+        List<EraOption> targets = new ArrayList<>();
+        int last = Math.min(current + SKIP_ERA_MAX_STEPS, names.length - 1);
+        for (int i = current + 1; i <= last; i++) {
+            targets.add(new EraOption(i, names[i]));
+        }
+        return new EraOptions(current, engine.currentEra(), List.of(names), targets);
+    }
+
+    /**
+     * 跳过当前时代：单人直接执行，不投票。
+     * 成功返回 result，校验失败返回 error。
+     */
+    @PostMapping("/skip-era")
+    public SkipEraResult skipEra(@RequestBody(required = false) SkipEraRequest request) {
+        if (request == null) {
+            return new SkipEraResult(null, "请提供 targetEraIndex");
+        }
+        int before = engine.currentEraIndex();
+        String message = engine.skipEra(request.targetEraIndex());
+        // 时代确实推进了才算成功；否则 message 是 skipEra 给出的校验失败原因
+        return engine.currentEraIndex() > before
+                ? new SkipEraResult(message, null)
+                : new SkipEraResult(null, message);
+    }
+
+    /** 新游戏：清空世界从零开始，并立刻覆盖存档文件。 */
+    @PostMapping("/new-game")
+    public NewGameResult newGame() {
+        String message = engine.resetWorld();
+        // 存档写失败不影响「世界已重置」，把失败原因带回给前端
+        String saveError = saveService == null ? null : saveService.saveWithResult();
+        return new NewGameResult(message, saveError);
+    }
+
     @PostMapping("/pause")
     public ClockResult pause() {
         clockService.pause();
@@ -150,6 +191,24 @@ public class WorldController {
     }
 
     public record SpeedRequest(int speed) {
+    }
+
+    public record SkipEraRequest(int targetEraIndex) {
+    }
+
+    /** 新游戏：result 是重置结果；存档写入失败时 error 非空（世界已经重置）。 */
+    public record NewGameResult(String result, String error) {
+    }
+
+    /** 跳过时代：成功给 result，校验失败给 error，另一个字段为 null。 */
+    public record SkipEraResult(String result, String error) {
+    }
+
+    /** 前端选时代用的一项：下标 + 名称。 */
+    public record EraOption(int index, String name) {
+    }
+
+    public record EraOptions(int currentEraIndex, String currentEra, List<String> eras, List<EraOption> targets) {
     }
 
     public record RunToMajorRequest(int maxYears) {
