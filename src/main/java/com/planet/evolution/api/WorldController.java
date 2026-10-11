@@ -12,17 +12,23 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.planet.evolution.dto.RegionView;
 import com.planet.evolution.dto.WorldStateResponse;
+import com.planet.evolution.mapper.WorldMapper;
 import com.planet.evolution.model.Civilization;
+import com.planet.evolution.model.Player;
 import com.planet.evolution.model.Planet;
 import com.planet.evolution.model.Region;
 import com.planet.evolution.model.World;
 import com.planet.evolution.service.ClockService;
+import com.planet.evolution.service.PlayerService;
 import com.planet.evolution.service.SaveService;
+import com.planet.evolution.service.VoteService;
 import com.planet.evolution.service.WorldService;
+import com.planet.evolution.simulation.EventType;
 import com.planet.evolution.simulation.EvolutionEngine;
 import com.planet.evolution.simulation.GameEvent;
 import com.planet.evolution.simulation.TechTree;
@@ -42,20 +48,29 @@ public class WorldController {
     private static final int SKIP_ERA_MAX_STEPS = 5;
     /** 玩家文明固定为 id = 1（与 ChatController / EvolutionEngine 一致），四柱从它取。 */
     private static final long PLAYER_CIV_ID = 1L;
+    /** 玩家指令事件的稀有度（与 ChatController.RARITY_PEACEFUL 一致）。 */
+    private static final int RARITY_PEACEFUL = 50;
 
     private final WorldService worldService;
     private final ClockService clockService;
     private final World world;
     private final EvolutionEngine engine;
     private final SaveService saveService;
+    private final WorldMapper worldMapper;
+    private final PlayerService playerService;
+    private final VoteService voteService;
 
     public WorldController(WorldService worldService, ClockService clockService, World world,
-            EvolutionEngine engine, SaveService saveService) {
+            EvolutionEngine engine, SaveService saveService, WorldMapper worldMapper,
+            PlayerService playerService, VoteService voteService) {
         this.worldService = worldService;
         this.clockService = clockService;
         this.world = world;
         this.engine = engine;
         this.saveService = saveService;
+        this.worldMapper = worldMapper;
+        this.playerService = playerService;
+        this.voteService = voteService;
     }
 
     @GetMapping
@@ -85,9 +100,184 @@ public class WorldController {
             pillars = new WorldStateResponse.Pillars(player.getScience(), player.getWelfare(),
                     player.getResource(), player.getMilitary());
         }
+        // 玩家概览：五种资源点 / 四个状态指标 / 个人时代（国家不存在时为 null）
+        WorldStateResponse.PlayerView playerView = null;
+        if (player != null) {
+            playerView = new WorldStateResponse.PlayerView(player.getId(), player.getName(),
+                    player.getFoundedYear(), player.getPopulation(), player.getTechLevel(),
+                    player.currentEra(), player.getEraIndex(),
+                    pointsOf(player), indicatorsOf(player));
+        }
+        // 终局判定：以引擎为准，再兜一层（玩家灭亡 / 到 1000 年）保证实时反映
+        boolean gameOver = engine.isGameOver();
+        String gameOverReason = engine.getGameOverReason();
+        if (!gameOver) {
+            if (player == null || player.getPopulation() <= 0) {
+                int founded = player == null ? 0 : player.getFoundedYear();
+                gameOver = true;
+                gameOverReason = "你的国家在 Y" + year + " 年灭亡，存活了 " + Math.max(0, year - founded) + " 年";
+            } else if (year >= EvolutionEngine.GAME_MAX_YEAR) {
+                gameOver = true;
+                gameOverReason = "你的国家活到了第 " + EvolutionEngine.GAME_MAX_YEAR + " 年";
+            }
+        }
         return new WorldStateResponse(state, clockService.currentSpeed(), clockService.isPaused(), pillars,
-                civilizations);
+                playerView, gameOver, gameOverReason, civilizations);
     }
+
+    // ==================== 玩家接口 ====================
+
+    /** 加入游戏：body {"name":"张三"} → 返回 {"sessionId":"xxx","civId":1} */
+    @PostMapping("/player/join")
+    public JoinResult join(@RequestBody(required = false) JoinRequest request) {
+        String name = request == null || request.name() == null ? "匿名" : request.name();
+        Player player = playerService.join(name);
+        // 第一个加入的玩家分配文明 id=1，第二个 id=2，以此类推
+        int civId = world.getCivilizations().isEmpty() ? 1
+                : (int) (world.getCivilizations().stream()
+                         .mapToLong(Civilization::getId)
+                         .max().orElse(0) + 1);
+        // 分配文明
+        player.setControlledCivId(civId);
+        return new JoinResult(player.getSessionId(), civId);
+    }
+
+    /** 切换控制的文明：body {"civId":3} */
+    @PostMapping("/player/choose-civ")
+    public ApiResult chooseCiv(@RequestBody(required = false) ChooseCivRequest request,
+                               @RequestParam(required = false) String sessionId) {
+        if (sessionId == null) {
+            return new ApiResult(false, "请提供 sessionId");
+        }
+        playerService.touch(sessionId);
+        Player player = playerService.get(sessionId);
+        if (player == null) {
+            return new ApiResult(false, "sessionId 无效");
+        }
+        if (request == null || request.civId() <= 0) {
+            return new ApiResult(false, "请提供 civId");
+        }
+        player.setControlledCivId(request.civId());
+        return new ApiResult(true, "已切换到文明 " + request.civId());
+    }
+
+    /** 列出在线玩家。 */
+    @GetMapping("/player/list")
+    public List<PlayerInfo> listPlayers() {
+        List<PlayerInfo> result = new ArrayList<>();
+        for (Player p : playerService.listOnline()) {
+            String civName = null;
+            Civilization civ = world.findCivilization(p.getControlledCivId());
+            if (civ != null) {
+                civName = civ.getName();
+            }
+            result.add(new PlayerInfo(p.getSessionId(), p.getName(), p.getControlledCivId(), civName));
+        }
+        return result;
+    }
+
+    // ==================== 同步接口 ====================
+
+    /** 快速同步：前端每秒调一次。 */
+    @GetMapping("/sync")
+    public SyncResult sync(@RequestParam(required = false) Long since,
+                          @RequestParam(required = false) String sessionId) {
+        // 更新玩家心跳
+        if (sessionId != null) {
+            playerService.touch(sessionId);
+        }
+        int eventCount = worldMapper.selectEvents().size();
+        int playerCount = playerService.listOnline().size();
+        // 区域归属映射
+        Map<Integer, Integer> regionOwners = new LinkedHashMap<>();
+        for (Region region : world.getRegionMap().all()) {
+            regionOwners.put(region.getId(), region.getOwnerCivId());
+        }
+        return new SyncResult(System.currentTimeMillis(), world.getYear(),
+                engine.isGameOver(), eventCount, playerCount, regionOwners);
+    }
+
+    // ==================== 投票接口 ====================
+
+    /** 发起投票：body {"type":"skip_era","targetEraIndex":7} */
+    @PostMapping("/vote/propose")
+    public VoteResult propose(@RequestBody(required = false) ProposeRequest request,
+                             @RequestParam(required = false) String sessionId) {
+        if (sessionId == null) {
+            return new VoteResult(false, "请提供 sessionId", null);
+        }
+        playerService.touch(sessionId);
+        if (request == null) {
+            return new VoteResult(false, "请提供请求体", null);
+        }
+        VoteService.ProposeResult proposed =
+                voteService.propose(request.type(), request.targetEraIndex(), sessionId);
+        switch (proposed.outcome()) {
+            // 单人：没有投票，已经直接执行完了
+            case EXECUTED -> {
+                return new VoteResult(true, proposed.message(), null);
+            }
+            // 单人尝试执行但被规则拒绝（如时代下标非法）
+            case FAILED -> {
+                return new VoteResult(false, proposed.message(), null);
+            }
+            case BUSY -> {
+                return new VoteResult(false, proposed.message(), null);
+            }
+            default -> {
+                return new VoteResult(true, proposed.message(), voteService.status());
+            }
+        }
+    }
+
+    /** 同意投票。 */
+    @PostMapping("/vote/agree")
+    public VoteResult agree(@RequestParam(required = false) String sessionId) {
+        if (sessionId == null) {
+            return new VoteResult(false, "请提供 sessionId", null);
+        }
+        playerService.touch(sessionId);
+        if (!voteService.hasVote()) {
+            return new VoteResult(false, "当前没有投票", null);
+        }
+        boolean passed = voteService.agree(sessionId);
+        VoteService.VoteStatus status = voteService.status();
+        if (passed) {
+            // 执行投票
+            executeVote();
+            return new VoteResult(true, "投票通过！", status);
+        }
+        return new VoteResult(true, "已同意", status);
+    }
+
+    /** 投票状态。 */
+    @GetMapping("/vote/status")
+    public VoteService.VoteStatus voteStatus() {
+        return voteService.status();
+    }
+
+    private void executeVote() {
+        VoteService.Vote vote = voteService.getCurrentVote();
+        if (vote == null) return;
+        if ("skip_era".equals(vote.type())) {
+            engine.skipEra(vote.targetValue());
+        } else if ("speed".equals(vote.type())) {
+            clockService.setSpeed(vote.targetValue());
+        }
+    }
+
+    // ==================== DTO ====================
+
+    public record JoinResult(String sessionId, int civId) {}
+    public record JoinRequest(String name) {}
+    public record ChooseCivRequest(int civId) {}
+    public record ApiResult(boolean ok, String message) {}
+    public record PlayerInfo(String sessionId, String name, int civId, String civName) {}
+    public record SyncResult(long serverTime, int year, boolean gameOver,
+                            int eventCount, int playerCount,
+                            Map<Integer, Integer> regionOwners) {}
+    public record ProposeRequest(String type, int targetEraIndex) {}
+    public record VoteResult(boolean ok, String message, VoteService.VoteStatus status) {}
 
     @GetMapping("/events")
     public List<GameEvent> getEvents() {
@@ -113,7 +303,7 @@ public class WorldController {
                 }
             }
             views.add(new RegionView(region.getId(), region.getName(), ownerId, ownerName,
-                    region.isExplored()));
+                    region.isExplored(), region.getTerrain()));
         }
         return views;
     }
@@ -199,21 +389,88 @@ public class WorldController {
     @GetMapping("/tech-tree")
     public TechTreeResponse getTechTree() {
         Civilization player = world.findCivilization(PLAYER_CIV_ID);
-        // 玩家不存在时按「什么都没解锁、也没在研究」处理，面板仍能展示完整科技树结构
+        // 玩家不存在时按「什么都没解锁、资源点全 0」处理，面板仍能展示完整科技树结构
         List<String> playerUnlocked = player == null
                 ? new ArrayList<>()
                 : new ArrayList<>(player.getUnlockedTechs());
-        String researching = player == null ? null : player.getCurrentResearchId();
+        Map<String, Integer> playerPoints = player == null
+                ? new LinkedHashMap<>()
+                : pointsOf(player);
+        int playerEraIndex = player == null ? 0 : player.getEraIndex();
+        String playerEra = player == null ? Civilization.ERAS[0] : player.currentEra();
 
         Map<String, List<TechNode>> branches = new LinkedHashMap<>();
         // 用 var 是为了和下面同名的响应 DTO TechNode 区分开（engine 的节点是 simulation.TechNode）
         for (var node : TechTree.all()) {
             boolean unlocked = player != null && player.hasUnlockedTech(node.id());
+            // 实际消耗：同组已选过别的节点时每种资源 ×2（前端据此显示"同组已选，×2"）
+            Map<String, Integer> costs = node.costs() == null ? Map.of() : node.costs();
+            Map<String, Integer> actualCosts = TechTree.actualCosts(node, player);
+            boolean penalized = TechTree.isPenalized(node, player);
             branches.computeIfAbsent(node.branch(), key -> new ArrayList<>())
-                    .add(new TechNode(node.id(), node.name(), node.prerequisite(), node.cost(), unlocked,
-                            node.id().equals(researching)));
+                    .add(new TechNode(node.id(), node.name(), node.prerequisite(), costs, actualCosts,
+                            node.cost(), unlocked, penalized));
         }
-        return new TechTreeResponse(branches, playerUnlocked, researching);
+        return new TechTreeResponse(branches, playerUnlocked, playerPoints, playerEraIndex, playerEra);
+    }
+
+    /** 玩家五种资源点（键为 food / production / military / culture / science）。 */
+    private static Map<String, Integer> pointsOf(Civilization civilization) {
+        return civilization.pointMap();
+    }
+
+    /** 玩家四个状态指标（键为 unrest / culture / prestige / tension）。 */
+    private static Map<String, Integer> indicatorsOf(Civilization civilization) {
+        Map<String, Integer> indicators = new LinkedHashMap<>();
+        indicators.put("unrest", civilization.getUnrest());
+        indicators.put("culture", civilization.getCulture());
+        indicators.put("prestige", civilization.getPrestige());
+        indicators.put("tension", civilization.getTension());
+        return indicators;
+    }
+
+    /**
+     * 直接研究某个科技节点（科技树面板专用，不走 AI 翻译）：
+     * 前端点节点 → body {"techId":"mil_gunpowder"} → 当场扣点、解锁、加科技、写事件。
+     *
+     * <p>校验顺序与 ChatController.doResearch 保持一致：节点存在 → 未解锁 → 前置满足 → 科技点足够（按实际成本，
+     * 即同组已选时 ×2）。互斥组不再硬性拦人，只加价。成功返回 result，任一校验失败返回 error。
+     */
+    @PostMapping("/research")
+    public ResearchResult research(@RequestBody(required = false) ResearchRequest request) {
+        String techId = request == null ? null : request.techId();
+        if (techId == null || techId.isBlank()) {
+            return new ResearchResult(null, "请提供 techId");
+        }
+        Civilization player = world.findCivilization(PLAYER_CIV_ID);
+        if (player == null || player.getPopulation() <= 0) {
+            return new ResearchResult(null, "玩家文明不存在或已灭亡");
+        }
+        com.planet.evolution.simulation.TechNode node = TechTree.getById(techId.trim());
+        if (node == null) {
+            return new ResearchResult(null, "科技树里没有这个科技：" + techId);
+        }
+        if (player.hasUnlockedTech(node.id())) {
+            return new ResearchResult(null, "已经研究过了");
+        }
+        if (node.prerequisite() != null && !player.hasUnlockedTech(node.prerequisite())) {
+            com.planet.evolution.simulation.TechNode prerequisite = TechTree.getById(node.prerequisite());
+            String prereqName = prerequisite != null ? prerequisite.name() : node.prerequisite();
+            return new ResearchResult(null, "需要先解锁【" + prereqName + "】");
+        }
+        // 实际消耗：同组已选过别的节点时每种资源 ×2
+        Map<String, Integer> costs = TechTree.actualCosts(node, player);
+        if (!TechTree.canAfford(player, costs)) {
+            return new ResearchResult(null, "资源点不够（需要 " + TechTree.costText(costs) + "）");
+        }
+        // 立即执行：扣点 → 解锁（顺带把对应产出系数 ×1.2）→ 科技 +techBonus
+        TechTree.pay(player, costs);
+        TechTree.unlock(player, node);
+        player.setTechLevel(player.getTechLevel() + node.techBonus());
+        worldMapper.insertEvent(new GameEvent(world.getYear(), EventType.PLAYER_COMMAND,
+                player.getName() + "解锁了【" + node.name() + "】", RARITY_PEACEFUL));
+        return new ResearchResult(
+                "已解锁【" + node.name() + "】，剩余 " + TechTree.costText(pointsOf(player)), null);
     }
 
     @PostMapping("/advance")
@@ -271,6 +528,21 @@ public class WorldController {
     }
 
     /**
+     * 新游戏（按所选开局时代）。body 形如 {"startEra":"ancient"}。
+     * 开局 key：savage / agrarian / ancient / medieval / industrial / information / interstellar。
+     */
+    @PostMapping("/new-game-with-era")
+    public NewGameResult newGameWithEra(@RequestBody(required = false) NewGameWithEraRequest request) {
+        String key = request == null ? null : request.startEra();
+        String message = engine.newGameWithEra(key);
+        if (message == null) {
+            return new NewGameResult(null, "未知的开局：" + key);
+        }
+        String saveError = saveService == null ? null : saveService.saveWithResult();
+        return new NewGameResult(message, saveError);
+    }
+
+    /**
      * 科技树研究模式：active = 玩家文明不自动研究、等玩家指令；passive = 玩家文明自动研究。
      * AI 文明两种模式下都自动研究。
      */
@@ -295,6 +567,39 @@ public class WorldController {
         // 模式已经生效；存档失败只作为提示返回，不回滚模式
         String saveError = saveService == null ? null : saveService.saveWithResult();
         return new ResearchModeResult(engine.getResearchMode(), saveError);
+    }
+
+    /**
+     * AI 参与度：normal = 每 20 年驱动一次世界；high = 每 10 年一次且参与国家更多。
+     * 默认 normal。两种档位都保持「一次 AI 调用最多 5 个国家」。
+     */
+    @GetMapping("/ai-level")
+    public AiLevelResult aiLevel() {
+        return new AiLevelResult(engine.getAiLevel(), null);
+    }
+
+    /**
+     * 切换 AI 参与度，body 形如 {"level":"high"}。
+     * 正常返回生效后的档位；入参非法时 error 非空、档位保持不变。
+     */
+    @PostMapping("/ai-level")
+    public AiLevelResult setAiLevel(@RequestBody(required = false) AiLevelRequest request) {
+        String level = request == null ? null : request.level();
+        if (level == null || level.isBlank()) {
+            return new AiLevelResult(engine.getAiLevel(), "请提供 level（normal 或 high）");
+        }
+        if (!engine.setAiLevel(level)) {
+            return new AiLevelResult(engine.getAiLevel(), "level 只能是 normal 或 high");
+        }
+        return new AiLevelResult(engine.getAiLevel(), null);
+    }
+
+    /** AI 参与度请求体：level 取 normal / high。 */
+    public record AiLevelRequest(String level) {
+    }
+
+    /** AI 参与度响应：level 是生效后的档位；error 非空表示入参被拒。 */
+    public record AiLevelResult(String level, String error) {
     }
 
     @PostMapping("/pause")
@@ -322,6 +627,15 @@ public class WorldController {
         return error == null ? new SaveResult(true, null) : new SaveResult(false, error);
     }
 
+    /**
+     * 存档概要：存档时间 / 年份 / 国家数。
+     * 存档不存在时 exists=false、year 与 civilizationCount 为 -1。
+     */
+    @GetMapping("/save-info")
+    public SaveService.SaveInfo saveInfo() {
+        return saveService.saveInfo();
+    }
+
     private ClockResult clockResult() {
         return new ClockResult(clockService.isPaused(), clockService.currentSpeed());
     }
@@ -343,6 +657,10 @@ public class WorldController {
 
     /** 新游戏：result 是重置结果；存档写入失败时 error 非空（世界已经重置）。 */
     public record NewGameResult(String result, String error) {
+    }
+
+    /** 按开局时代重开：startEra 是开局 key。 */
+    public record NewGameWithEraRequest(String startEra) {
     }
 
     /** 研究模式请求体：mode 取 active / passive。 */
@@ -384,13 +702,29 @@ public class WorldController {
 
     // ==================== 科技树 ====================
 
-    /** 科技树里一个节点（对外视图）。prerequisite 为 null 表示这是分支起点。 */
-    public record TechNode(String id, String name, String prerequisite, int cost, boolean unlocked,
-            boolean researching) {
+    /**
+     * 科技树里一个节点（对外视图）。prerequisite 为 null 表示这是树根。
+     * costs 是基础消耗（按资源类型，如 {"science":100,"production":50}）；
+     * actualCosts 是实际消耗（同组已选过别的节点时每种资源 ×2）；totalCost 是实际消耗之和，便于排序；
+     * penalized 标记是否正被同组惩罚，前端据此显示「（同组已选，×2）」。
+     */
+    public record TechNode(String id, String name, String prerequisite, Map<String, Integer> costs,
+            Map<String, Integer> actualCosts, int totalCost, boolean unlocked, boolean penalized) {
     }
 
-    /** 科技树响应。branches 按分支 key 分组；playerResearching 没有在研节点时为 null。 */
+    /**
+     * 科技树响应。branches 按分支 key 分组；playerPoints 是玩家当前五种资源点；
+     * playerEraIndex/Era 是玩家个人时代。
+     */
     public record TechTreeResponse(Map<String, List<TechNode>> branches, List<String> playerUnlocked,
-            String playerResearching) {
+            Map<String, Integer> playerPoints, int playerEraIndex, String playerEra) {
+    }
+
+    /** 直接研究请求体：techId 是科技树节点的 id。 */
+    public record ResearchRequest(String techId) {
+    }
+
+    /** 直接研究响应：成功给 result，校验失败给 error，另一个字段为 null。 */
+    public record ResearchResult(String result, String error) {
     }
 }

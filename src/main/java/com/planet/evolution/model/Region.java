@@ -16,14 +16,21 @@ public class Region {
     private final List<Integer> neighbors;
     /** 玩家是否已探索该区域：false 表示还在黑雾里（前端盖深色遮罩）。 */
     private boolean explored;
+    /** 地形类型：plains / mountain / desert / forest / tundra / jungle。 */
+    private String terrain;
 
     public Region(int id, String name, List<Integer> neighbors) {
+        this(id, name, neighbors, "plains");
+    }
+
+    public Region(int id, String name, List<Integer> neighbors, String terrain) {
         this.id = id;
         this.name = name;
         this.ownerCivId = UNOWNED;
         this.neighbors = new ArrayList<>(neighbors);
         // 默认未探索，开局由 World.exploreAround 点亮玩家领土及一圈邻区
         this.explored = false;
+        this.terrain = terrain;
     }
 
     public int getId() {
@@ -58,5 +65,14 @@ public class Region {
 
     public void setExplored(boolean explored) {
         this.explored = explored;
+    }
+
+    /** 地形类型（plains / mountain / desert / forest / tundra / jungle）。 */
+    public String getTerrain() {
+        return terrain;
+    }
+
+    public void setTerrain(String terrain) {
+        this.terrain = terrain;
     }
 }

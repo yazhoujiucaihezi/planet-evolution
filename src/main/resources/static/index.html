@@ -6,138 +6,171 @@
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <!-- 顶部标题栏 -->
-  <header>
+  <!-- 地图：占满整个屏幕 -->
+  <svg id="mainMap" viewBox="0 0 1000 500">
+    <g id="fxLayer"></g>
+  </svg>
+
+  <!-- 顶部资源条（浮层，48px） -->
+  <header class="topbar">
+    <button id="toggleSidebar" class="icon-btn" title="折叠 / 展开面板" aria-label="折叠 / 展开面板">☰</button>
     <h1 id="planetName">星球演化</h1>
-    <div class="year">年份 <span id="year">-</span></div>
+    <div class="topbar-stats">
+      <span class="stat">人口 <b id="population">-</b></span>
+      <span class="stat-sep">·</span>
+      <span class="stat">科技 <b id="techTotal">-</b></span>
+      <span class="stat-sep">·</span>
+      <span class="stat">科技点 <b id="myTechPoints">-</b></span>
+      <span class="stat-sep">·</span>
+      <span class="stat">时代 <b id="era">-</b></span>
+      <span class="stat-sep">·</span>
+      <span class="stat">年份 <b id="year">-</b></span>
+    </div>
+    <div id="playerInfo" class="player-info" hidden>
+      <span id="playerName" class="player-name">-</span>
+      <span class="player-civ">控制：<span id="playerCiv">-</span></span>
+    </div>
   </header>
 
+  <!-- 错误/通知提示 -->
   <p id="error" class="error" hidden></p>
 
-  <!-- 主区域：信息面板 -->
-  <main class="main-area">
-    <!-- 世界状态 -->
-    <section class="panel">
-      <h2>世界状态</h2>
-      <dl class="stats">
-        <dt>时代</dt><dd id="era">-</dd>
-        <dt>总人口</dt><dd id="population">-</dd>
-        <dt>总科技</dt><dd id="techTotal">-</dd>
-        <dt>四柱</dt><dd id="pillars-summary">-</dd>
-      </dl>
-      <div class="controls">
-        <button id="openTechTree">科技树</button>
-      </div>
-    </section>
+  <!-- 左侧面板（浮层，可折叠） -->
+  <aside id="sidePanel" class="sidebar">
+    <div class="sidebar-header">
+      <span class="sidebar-title">控制面板</span>
+      <button id="sidebarCollapseBtn" class="collapse-btn" title="折叠面板">◀</button>
+    </div>
+    <div class="sidebar-body">
+      <section class="side-block">
+        <h2>我的国家</h2>
+        <dl class="stats">
+          <dt>我的科技</dt><dd id="myTech">-</dd>
+          <dt>我的时代</dt><dd id="myEra">-</dd>
+          <dt>世界时代</dt><dd id="worldEra">-</dd>
+          <dt>剩余年数</dt><dd id="yearsLeft">-</dd>
+        </dl>
+      </section>
 
-    <!-- 四柱详情 -->
-    <section class="panel">
-      <h2>王国状态 <span class="badge">四柱</span></h2>
-      <div class="pillars">
-        <div class="pillar">
-          <span class="pillar-name">科技</span>
-          <div class="pillar-track"><div class="pillar-fill" id="pillarScience"></div></div>
-          <span class="pillar-value" id="pillarScienceValue">-</span>
+      <section class="side-block">
+        <h2>王国四柱</h2>
+        <div class="pillars">
+          <div class="pillar">
+            <span class="pillar-name">科技</span>
+            <div class="pillar-track"><div class="pillar-fill" id="pillarScience"></div></div>
+            <span class="pillar-value" id="pillarScienceValue">-</span>
+          </div>
+          <div class="pillar">
+            <span class="pillar-name">民生</span>
+            <div class="pillar-track"><div class="pillar-fill" id="pillarWelfare"></div></div>
+            <span class="pillar-value" id="pillarWelfareValue">-</span>
+          </div>
+          <div class="pillar">
+            <span class="pillar-name">资源</span>
+            <div class="pillar-track"><div class="pillar-fill" id="pillarResource"></div></div>
+            <span class="pillar-value" id="pillarResourceValue">-</span>
+          </div>
+          <div class="pillar">
+            <span class="pillar-name">军力</span>
+            <div class="pillar-track"><div class="pillar-fill" id="pillarMilitary"></div></div>
+            <span class="pillar-value" id="pillarMilitaryValue">-</span>
+          </div>
         </div>
-        <div class="pillar">
-          <span class="pillar-name">民生</span>
-          <div class="pillar-track"><div class="pillar-fill" id="pillarWelfare"></div></div>
-          <span class="pillar-value" id="pillarWelfareValue">-</span>
+      </section>
+
+      <section class="side-block">
+        <h2>时间</h2>
+        <div class="side-controls">
+          <label class="side-field">推进年数
+            <input id="years" type="number" min="1" max="10000" value="10">
+          </label>
+          <button id="advance">推进</button>
+          <button id="runToMajor">大事模式</button>
+          <button id="skipEra">跳过时代</button>
+          <button id="pause">暂停</button>
+          <button id="resume">恢复</button>
+          <label class="side-field">速度 1~100
+            <input id="speed" type="number" min="1" max="100" value="1">
+          </label>
+          <button id="setSpeed">设置速度</button>
         </div>
-        <div class="pillar">
-          <span class="pillar-name">资源</span>
-          <div class="pillar-track"><div class="pillar-fill" id="pillarResource"></div></div>
-          <span class="pillar-value" id="pillarResourceValue">-</span>
+      </section>
+
+      <section class="side-block">
+        <h2>操作</h2>
+        <div class="side-controls">
+          <button id="openTechTree">科技树</button>
+          <button id="saveWorld">保存世界</button>
+          <button id="newGame">新游戏</button>
+          <label class="side-field">AI 参与度
+            <select id="aiLevel">
+              <option value="normal">普通</option>
+              <option value="high">高</option>
+            </select>
+          </label>
         </div>
-        <div class="pillar">
-          <span class="pillar-name">军力</span>
-          <div class="pillar-track"><div class="pillar-fill" id="pillarMilitary"></div></div>
-          <span class="pillar-value" id="pillarMilitaryValue">-</span>
-        </div>
-      </div>
-      <p class="note">四柱 0~100，初始 50；任意一柱触底或爆满都会引发崩溃（人口减半）。</p>
-    </section>
+      </section>
+    </div>
+  </aside>
 
-    <!-- 时间控制 -->
-    <section class="panel">
-      <h2>时间控制</h2>
-      <div class="controls">
-        <label>推进年数
-          <input id="years" type="number" min="1" max="10000" value="10">
-        </label>
-        <button id="advance">推进</button>
-        <button id="runToMajor">大事模式：跑到下一个重大事件</button>
-        <button id="skipEra">跳过时代</button>
-      </div>
-      <div class="controls">
-        <button id="pause">暂停</button>
-        <button id="resume">恢复</button>
-        <label>速度 1~100
-          <input id="speed" type="number" min="1" max="100" value="1">
-        </label>
-        <button id="setSpeed">设置速度</button>
-        <button id="saveWorld">保存世界</button>
-        <button id="newGame">新游戏</button>
-      </div>
-      <p class="note">说明：暂停 / 恢复 / 速度目前仅设置后端状态，后端尚未实现按倍率自动推进；推进请使用上方按钮。</p>
-    </section>
-
-    <!-- 玩家指挥 -->
-    <section class="panel">
-      <h2>玩家指挥</h2>
-      <div class="controls">
-        <label>用一句话下达指令
-          <input id="commandText" type="text" size="40" placeholder="例如：攻打南亚 / 发展科技 / 扩张">
-        </label>
-        <button id="sendCommand">发送</button>
-      </div>
-      <p id="commandResult" class="note">支持：attack（攻打区域）、develop_tech（发展科技）、expand（扩张）。</p>
-    </section>
-
-    <!-- 历史事件 -->
-    <section class="panel">
-      <h2>历史事件 <span id="eventCount" class="badge"></span></h2>
-      <p class="note">高亮为重大事件（稀有度 ≥ 60）。</p>
-      <ul id="events"></ul>
-    </section>
-  </main>
-
-  <!-- 右下角小地图 -->
-  <div id="miniMapContainer" class="mini-map-container">
+  <!-- 小地图（浮层，右下角） -->
+  <div id="miniMapContainer" class="mini-map-container" title="点击缩略图移动主地图">
     <svg id="miniMap" viewBox="0 0 1000 500"></svg>
-    <p class="mini-map-hint">点击查看大地图</p>
   </div>
 
-  <!-- 弹出全屏地图遮罩 -->
-  <div id="mapOverlay" class="map-overlay" hidden>
-    <div class="map-container">
-      <svg id="bigMap" viewBox="0 0 1000 500"></svg>
+  <!-- 区域详情（浮层，右侧滑出） -->
+  <div id="regionDetail" class="region-detail" hidden>
+    <button id="closeRegionDetail" class="region-close" title="关闭">×</button>
+    <h3 id="regionName">-</h3>
+    <div class="region-owner">
+      <span class="civ-color" id="civColor"></span>
+      <span id="civName">无主</span>
     </div>
-    <div class="map-controls">
-      <button id="closeMapOverlay">关闭</button>
-      <button id="highlightPlayer">我的领地</button>
-      <button id="resetMapView">重置视图</button>
+    <div id="civStats" class="civ-stats" hidden>
+      <p>人口 <span id="civPop">-</span></p>
+      <p>科技 <span id="civTech">-</span></p>
+      <p>领土 <span id="civTerr">-</span></p>
     </div>
-    <!-- 区域详情面板 -->
-    <div id="regionDetail" class="region-detail" hidden>
-      <h3 id="regionName">-</h3>
-      <div class="region-owner">
-        <span class="civ-color" id="civColor"></span>
-        <span id="civName">无主</span>
-      </div>
-      <div id="civStats" class="civ-stats" hidden>
-        <p>人口 <span id="civPop">-</span></p>
-        <p>科技 <span id="civTech">-</span></p>
-        <p>领土 <span id="civTerr">-</span></p>
-      </div>
-      <div class="neighbors-section">
-        <h4>邻接区域</h4>
-        <ul id="neighborsList"></ul>
-      </div>
-      <div class="events-section">
-        <h4>最近事件</h4>
-        <ul id="regionEvents"></ul>
-      </div>
+    <div class="neighbors-section">
+      <h4>邻接区域</h4>
+      <ul id="neighborsList"></ul>
+    </div>
+    <div class="events-section">
+      <h4>最近事件</h4>
+      <ul id="regionEvents"></ul>
+    </div>
+  </div>
+
+  <!-- 底部输入条（浮层） -->
+  <footer class="bottombar">
+    <div class="command-row">
+      <input id="commandText" type="text" placeholder="例如：攻打南亚 / 发展科技 / 扩张 / 建长城 / 飞出地球">
+      <button id="sendCommand">发送</button>
+      <button id="toggleEvents" class="events-toggle" aria-expanded="false">
+        <span id="eventsCaret" class="caret">▸</span>
+        <span>历史事件</span>
+        <span id="eventCount" class="badge"></span>
+      </button>
+    </div>
+    <!-- 外交提示条：有 AI 外交待回应时出现，点按钮 = 在输入框发「同意」/「拒绝」 -->
+    <div id="diplomacyBar" class="diplomacy-bar" hidden>
+      <span id="diplomacyText" class="diplomacy-text"></span>
+      <span class="diplomacy-actions">
+        <button id="diplomacyAgree" type="button">同意</button>
+        <button id="diplomacyReject" type="button">拒绝</button>
+      </span>
+    </div>
+    <p id="commandResult" class="note">支持：进攻、扩张、研究，以及任何自由行动。</p>
+  </footer>
+
+  <!-- 历史事件面板（从底部滑上来，占屏幕下半） -->
+  <div id="eventsPanel" class="events-panel-float">
+    <div class="events-panel-header">
+      <span>历史事件</span>
+      <button id="closeEventsPanel" class="close-btn" title="关闭">×</button>
+    </div>
+    <div id="eventsBody" class="events-body-float">
+      <ul id="events"></ul>
     </div>
   </div>
 
@@ -166,6 +199,47 @@
           <h3>太空</h3>
           <div class="tech-nodes" id="techBranchSpace"></div>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 开局选时代 -->
+  <div id="eraPicker" class="tech-overlay" hidden>
+    <div class="tech-dialog" style="width:min(560px,100%)">
+      <div class="tech-head">
+        <h2>选择开局时代</h2>
+        <button id="closeEraPicker" class="tech-close">关闭</button>
+      </div>
+      <p class="note">选一个时代重开一局（会清空当前世界，无法恢复）。</p>
+      <div id="eraPickerList" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:12px;"></div>
+    </div>
+  </div>
+
+  <!-- 地图悬停提示 -->
+  <div id="mapTooltip" class="map-tooltip" hidden></div>
+
+  <!-- 核弹爆炸文字弹窗 -->
+  <div id="nukePopup" class="nuke-popup"></div>
+
+  <!-- 事件弹窗容器（右上角堆叠） -->
+  <div id="eventToasts" class="event-toasts"></div>
+
+  <!-- 时代晋升金光遮罩 -->
+  <div id="eraFlash" class="era-flash"></div>
+
+  <!-- 结算画面 -->
+  <div id="gameOverOverlay" class="tech-overlay" hidden>
+    <div class="tech-dialog" style="width:min(520px,100%);text-align:center">
+      <h2 style="font-size:24px;color:#4a9eff;margin:0 0 12px">这一局结束了</h2>
+      <p id="gameOverReason" class="note" style="font-size:14px">-</p>
+      <dl class="stats" style="margin-top:16px;text-align:left">
+        <dt>国家</dt><dd id="overName">-</dd>
+        <dt>存活年数</dt><dd id="overYears">-</dd>
+        <dt>最终人口</dt><dd id="overPop">-</dd>
+        <dt>最终科技</dt><dd id="overTech">-</dd>
+      </dl>
+      <div style="margin-top:16px">
+        <button id="playAgain">再来一局</button>
       </div>
     </div>
   </div>

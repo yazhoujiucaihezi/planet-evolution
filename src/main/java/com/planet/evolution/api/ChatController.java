@@ -2,8 +2,12 @@ package com.planet.evolution.api;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -14,6 +18,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.planet.evolution.ai.AiNarrator;
 import com.planet.evolution.mapper.WorldMapper;
 import com.planet.evolution.model.Civilization;
+import com.planet.evolution.model.Memory;
 import com.planet.evolution.model.Region;
 import com.planet.evolution.simulation.EventType;
 import com.planet.evolution.simulation.EvolutionEngine;
@@ -34,6 +39,12 @@ public class ChatController {
     private static final long PLAYER_CIV_ID = 1L;
     /** develop_tech 每次增加的科技。 */
     private static final int DEVELOP_TECH_GAIN = 50;
+    /** develop_tech 顺带给的科技点（科学点）。 */
+    private static final int DEVELOP_TECH_SCIENCE_GAIN = 20;
+    /** 打赢一场仗的威望奖励（与 EvolutionEngine 的口径一致）。 */
+    private static final int PRESTIGE_WIN_WAR = 30;
+    /** 建新城（扩张一块领土）的威望奖励。 */
+    private static final int PRESTIGE_NEW_CITY = 20;
     /** attack 造成的损失比例。 */
     private static final double ATTACK_SEVERITY = 0.20;
     /** 玩家方在战争中的损失比例。 */
@@ -44,6 +55,49 @@ public class ChatController {
     private static final int RARITY_PEACEFUL = 50;
     /** 核子时代的科技门槛，与 EvolutionEngine.ERA_THRESHOLDS[11]（ERAS[11] = "核子时代"）一致。 */
     private static final int NUKE_TECH_REQUIRED = 7000;
+
+    /**
+     * 自由行动（free）的能力门槛：说法里命中关键词 → 需要解锁的科技树节点。
+     *
+     * <p>后端终判：检查 player.getUnlockedTechs() 里是否有对应的节点 id，有则放行，无则拒绝。
+     *
+     * <p>列表按门槛**从高到低**排列，命中最高的那一档为准。
+     */
+    private record CapabilityGate(String requiredNodeId, String label, List<String> keywords) {
+    }
+
+    /** 能力门槛表（与 prompt 里那张表同源，后端终判用）。 */
+    private static final List<CapabilityGate> CAPABILITY_GATES = List.of(
+            // 星际航行 / 月球基地 → 火箭节点（spc_rocket）解锁后可飞出地球、登月、殖民火星
+            new CapabilityGate("spc_rocket", "星际航行",
+                    List.of("星际航行", "月球基地", "飞出太阳系", "殖民火星", "曲率")),
+            // 卫星 / 空间站 → 卫星节点（spc_satellite）解锁后可造卫星、建空间站
+            new CapabilityGate("spc_satellite", "卫星与空间站",
+                    List.of("卫星", "空间站")),
+            // 核弹 → 核弹节点（mil_nuke）解锁后可核打击
+            new CapabilityGate("mil_nuke", "核弹",
+                    List.of("核弹", "核武器", "核打击")),
+            // 火箭（飞出地球）→ 火箭节点
+            new CapabilityGate("spc_rocket", "火箭",
+                    List.of("火箭", "飞出地球", "飞出大气层", "进入太空", "上太空", "航天", "登月")),
+            // 电力 / 汽车 → 自动化节点（eco_automation）解锁后可建电网、造汽车
+            new CapabilityGate("eco_automation", "电力与汽车",
+                    List.of("电力", "发电", "汽车", "内燃机", "电报")),
+            // 蒸汽机 / 铁路 → 铁路节点（eco_railway）解锁后可建铁路
+            new CapabilityGate("eco_railway", "蒸汽机与铁路",
+                    List.of("蒸汽机", "铁路", "火车")),
+            // 火药 / 大航海 → 指南针节点（spc_compass）解锁后可远洋航行
+            new CapabilityGate("spc_compass", "火药与大航海",
+                    List.of("火药", "大航海", "远洋", "印刷")),
+            // 冶金 / 城市 / 长城 → 工厂节点（eco_factory）解锁后可建城市设施
+            new CapabilityGate("eco_factory", "冶金与城市",
+                    List.of("冶金", "钢铁", "城市", "长城", "铸剑")),
+            // 农业 / 文字 → 农业改良节点（eco_agriculture）解锁后可发展农业
+            new CapabilityGate("eco_agriculture", "农业与文字",
+                    List.of("农业", "灌溉")),
+            // 文字 / 车轮 → 哲学节点（soc_philosophy）解锁后可发明文字
+            new CapabilityGate("soc_philosophy", "文字与车轮",
+                    List.of("文字", "房屋", "车轮")));
     /** 核打击事件的稀有度（最高档）。 */
     private static final int RARITY_NUKE = 100;
     /** 塞进 prompt 的最近事件条数：条数太多会把指令规则淹没。 */
@@ -60,13 +114,33 @@ public class ChatController {
     private static final long FREE_STOCK_LIMIT = 5_000_000L;
     /** 已知的固定动作；AI 给出别的（含空的 unknown）时一律回退为 free。 */
     private static final Set<String> KNOWN_ACTIONS = Set.of(
-            "ask", "attack", "nuke", "expand", "develop_tech", "research", "list_research", "free");
+            "ask", "attack", "nuke", "expand", "develop_tech", "research", "list_research", "diplomacy", "free");
+
+    // ==================== 外交回应（action=diplomacy） ====================
+
+    /** 玩家对外交的态度：同意。 */
+    private static final String STANCE_AGREE = "agree";
+    /** 玩家对外交的态度：拒绝。 */
+    private static final String STANCE_REJECT = "reject";
+    /** 玩家对外交的态度：开战。 */
+    private static final String STANCE_WAR = "war";
+    /** 开战类回应造成的关系恶化。 */
+    private static final int DIPLOMACY_WAR_RELATION = -20;
+    /** 拒绝"给好处"类外交（通商 / 送礼 / 求援）只掉 5 关系。 */
+    private static final int DIPLOMACY_MILD_REJECT = -5;
+    /** 拒绝其余外交掉 10 关系。 */
+    private static final int DIPLOMACY_HARSH_REJECT = -10;
+    /** 通商成功：双方资源柱各 +5。 */
+    private static final int DIPLOMACY_TRADE_RESOURCE_GAIN = 5;
+    /** 援助对方：世界资源按此比例扣减。 */
+    private static final double DIPLOMACY_AID_RESOURCE_COST = 0.95;
 
     private final World world;
     private final EvolutionEngine engine;
     private final AiNarrator aiNarrator;
     private final WorldMapper worldMapper;
     private final ObjectMapper objectMapper;
+    private final ReentrantLock commandLock = new ReentrantLock();
 
     public ChatController(World world, EvolutionEngine engine, AiNarrator aiNarrator,
             WorldMapper worldMapper, ObjectMapper objectMapper) {
@@ -84,6 +158,25 @@ public class ChatController {
         if (text == null || text.isBlank()) {
             return new CommandResult(null, "指令为空");
         }
+
+        // 加锁：拿不到锁说明有其他玩家正在操作
+        try {
+            if (!commandLock.tryLock(2, TimeUnit.SECONDS)) {
+                return new CommandResult(null, "世界正在被其他玩家操作，请稍后重试");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new CommandResult(null, "操作被中断，请重试");
+        }
+
+        try {
+            return executeCommand(text);
+        } finally {
+            commandLock.unlock();
+        }
+    }
+
+    private CommandResult executeCommand(String text) {
         Civilization player = playerCivilization();
         if (player == null) {
             return new CommandResult(null, "找不到玩家文明（id=1）或它已灭亡");
@@ -101,6 +194,8 @@ public class ChatController {
         String scope;
         String target;
         String replyText;
+        /** 仅 action=diplomacy 时用到：玩家对外交的态度 agree / reject / war。 */
+        String stance;
         int[] pillarDelta;
         // free（自由行动）相关字段
         boolean freeFailed = false;
@@ -120,6 +215,8 @@ public class ChatController {
             target = node.path("target").asText("").trim();
             // 只有 action=ask 会用到 reply；其他 action 即使带了 reply 也一律忽略（下面的 switch 不读它）
             replyText = node.path("reply").asText("").trim();
+            // 只有 action=diplomacy 会用到 stance；缺失或认不出时按原话关键词兜底（见 normalizeStance）
+            stance = node.path("stance").asText("").trim().toLowerCase();
             // 四柱变化由 AI 顺手判断，缺失或非法一律当 0，绝不让它影响指令本身的执行
             pillarDelta = parsePillarDeltas(node.path("pillars"));
             if ("free".equals(action)) {
@@ -138,6 +235,13 @@ public class ChatController {
         // 只看清单的指令（list_research，以及没带科技名的 research）不算治国动作，不参与四柱变化
         boolean viewOnly = "list_research".equals(action) || ("research".equals(action) && target.isBlank());
 
+        // 本次指令产生的战斗：边执行边收集，最后原样回给前端播动画
+        List<CombatEvent> combatEvents = new ArrayList<>();
+        // 混乱度：本条指令的累计从零开始（单次上限按整条指令算）
+        if (engine != null) {
+            engine.beginChaos();
+        }
+
         String result;
         switch (action) {
             case "ask" -> result = replyText.isEmpty()
@@ -145,22 +249,24 @@ public class ChatController {
                     : replyText;
             case "attack" -> {
                 if (targetCivIds == null || targetCivIds.isEmpty()) {
-                    result = attackNoTargetMessage(player, target);
+                    result = attackNoTargetMessage(player, target, combatEvents);
                 } else {
-                    result = doAttack(player, targetCivIds);
+                    result = doAttack(player, targetCivIds, combatEvents);
                 }
             }
             case "nuke" -> {
                 if (targetCivIds == null || targetCivIds.isEmpty()) {
                     result = "没听清要核平谁。可以说「核平全世界」「核平最强的」这类话，我再判断。";
                 } else {
-                    result = doNuke(player, targetCivIds);
+                    result = doNuke(player, targetCivIds, combatEvents);
                 }
             }
             case "develop_tech" -> result = doDevelopTech(player);
             // research 没带科技名（「研究」这种没头没尾的）→ 按「看清单」处理，不报「没听清要研究什么」
             case "research" -> result = target.isBlank() ? doListResearch(player) : doResearch(player, target);
             case "list_research" -> result = doListResearch(player);
+            // 外交回应：目标不由 AI 决定，取引擎里挂起的「最近一条外交」，stance 只区分同意/拒绝/开战
+            case "diplomacy" -> result = doDiplomacy(player, stance, text, combatEvents);
             case "expand" -> {
                 if ("ONE".equals(scope) && !target.isEmpty()) {
                     result = doExpandTo(player, target);
@@ -170,9 +276,21 @@ public class ChatController {
                     result = doExpand(player);
                 }
             }
-            // 自由行动：玩家说什么都能尝试（AI 已按能力门槛判断可行性）
-            case "free" -> result = doFree(player, freeFailed, freeReason, freeNarrative, freeEvent,
-                    freeEffects, freeNewRegions);
+            // 自由行动：玩家说什么都能尝试。能力门槛由后端终判（检查科技树节点），AI 只负责"想干什么"。
+            case "free" -> {
+                CapabilityGate gate = matchCapabilityGate(text);
+                String gateFail = capabilityGateFailure(player, text);
+                if (gateFail != null) {
+                    result = gateFail;
+                } else if (gate != null && freeFailed) {
+                    // 门槛其实过了，AI 却判成失败：以后端为准，放行
+                    result = doFree(player, false, freeReason, freeNarrative, freeEvent,
+                            freeEffects, freeNewRegions);
+                } else {
+                    result = doFree(player, freeFailed, freeReason, freeNarrative, freeEvent,
+                            freeEffects, freeNewRegions);
+                }
+            }
             default -> result = "我试着照做，但没能理解出可行的结果，换种说法再试试。";
         }
 
@@ -184,7 +302,14 @@ public class ChatController {
                 result = result + "\n" + crash;
             }
         }
-        return new CommandResult(result, null);
+
+        // 关键事件后：让 AI 判断这次指令是否留下长期后果（因果种子）。
+        // 问问题 / 看清单不算治国动作，不种种子。
+        if (engine != null && !"ask".equals(action) && !viewOnly) {
+            engine.considerSeed((int) PLAYER_CIV_ID, "玩家指令「" + text + "」，结果是：" + result);
+        }
+        return new CommandResult(result, null, combatEvents,
+                engine == null ? null : engine.consumeChaosChange());
     }
 
     // ==================== 四柱（参考《王权》） ====================
@@ -301,7 +426,7 @@ public class ChatController {
      *
      * @param target AI 翻译出的目标名字（scope=ONE 时才有意义）
      */
-    private String attackNoTargetMessage(Civilization player, String target) {
+    private String attackNoTargetMessage(Civilization player, String target, List<CombatEvent> combatEvents) {
         if (target != null && !target.trim().isEmpty()) {
             Region region = findRegionByName(target);
             if (region != null) {
@@ -315,7 +440,7 @@ public class ChatController {
                 }
                 if (owner != null && owner.getPopulation() > 0) {
                     // 有主且归属者存活：本不该走到这里，兜底按归属文明正常打
-                    return doAttack(player, List.of(owner.getId()));
+                    return doAttack(player, List.of(owner.getId()), combatEvents);
                 }
                 return region.getName() + "的归属文明已经灭亡，没有可攻击的文明。";
             }
@@ -329,23 +454,27 @@ public class ChatController {
      * ratio &gt; 3 守方直接灭亡且区域归玩家；ratio &gt; 1.5 守方损失 60%，跌破灭绝线即灭亡并占地；
      * 0.7 &le; ratio &le; 1.5 双方各损失 30%；ratio &lt; 0.7 玩家损失 40%。
      */
-    private String doAttack(Civilization player, List<Long> targetCivIds) {
+    private String doAttack(Civilization player, List<Long> targetCivIds, List<CombatEvent> combatEvents) {
         if (targetCivIds == null || targetCivIds.isEmpty()) {
             return "没听清要打谁。可以说「攻打南亚」「打旁边的」这类话，我再判断。";
         }
         List<String> messages = new ArrayList<>();
+        // 同时打多个国家算「大范围攻击」
+        if (engine != null && targetCivIds.size() > 1) {
+            engine.addChaos(10, "大范围攻击");
+        }
         for (Long civId : targetCivIds) {
             if (player.getPopulation() <= 0) {
                 messages.add("你的文明已经灭亡，后续目标不再进攻。");
                 break;
             }
-            messages.add(attackOne(player, civId));
+            messages.add(attackOne(player, civId, combatEvents));
         }
         return String.join("\n", messages);
     }
 
     /** 对单个文明发起一次进攻：只打它与玩家接壤的那块边境区域，然后按四档人口比结算。 */
-    private String attackOne(Civilization player, long defenderCivId) {
+    private String attackOne(Civilization player, long defenderCivId, List<CombatEvent> combatEvents) {
         Civilization defender = findCivilization(defenderCivId);
         if (defender == null) {
             return "找不到 id=" + defenderCivId + " 的文明，跳过。";
@@ -362,6 +491,14 @@ public class ChatController {
         }
 
         int year = world.getYear();
+
+        // 战斗确实发生了（找到了接壤的边境区域）：直接记一条给前端播动画
+        combatEvents.add(new CombatEvent((int) player.getId(), (int) defender.getId(),
+                region.getId(), "attack"));
+        // 战争标记：双方和平年数清零，年内标记为「卷入战争」（状态指标据此加民怨 / 紧张度、扣文化）
+        if (engine != null) {
+            engine.noteWar(player, defender);
+        }
 
         long playerPopulation = player.getPopulation();
         long defenderPopulation = defender.getPopulation();
@@ -400,10 +537,24 @@ public class ChatController {
         long playerLoss = Math.round(playerPopulation * playerLossRate);
         long defenderLeft = Math.max(0, defenderPopulation - defenderLoss);
         long playerLeft = Math.max(0, playerPopulation - playerLoss);
+        // 威望：损失更小的一方算「打赢了」
+        if (defenderLossRate >= playerLossRate) {
+            player.addPrestige(PRESTIGE_WIN_WAR);
+        } else {
+            defender.addPrestige(PRESTIGE_WIN_WAR);
+        }
 
         long extinctionLine = engine.getProfile().extinctionPopulation();
         boolean defenderDied = crushed || defenderLeft < extinctionLine;
         boolean playerDied = playerLeft < extinctionLine;
+        // 混乱度：主动宣战 +5；打盟约国（关系 > 50）+20；把对方打灭国再 +10
+        if (engine != null) {
+            boolean betrayedAlly = player.relationTo(defender.getId()) > 50;
+            engine.addChaos(betrayedAlly ? 20 : 5, betrayedAlly ? "违反盟约" : "主动宣战");
+            if (defenderDied) {
+                engine.addChaos(10, "灭国");
+            }
+        }
 
         if (defenderDied) {
             defender.setPopulation(0L);
@@ -445,8 +596,11 @@ public class ChatController {
             message.append("。双方均未灭国，领土未变。");
         }
 
+        // 带背景：谁、什么性格、跟对方什么关系
         record(year, EventType.PLAYER_COMMAND,
-                player.getName() + "进攻" + defender.getName() + "的" + region.getName()
+                "【" + player.getName() + "】（" + player.personalityLabel() + "，对" + defender.getName()
+                        + "关系" + player.relationTo(defender.getId()) + "）进攻【" + defender.getName() + "】的"
+                        + region.getName()
                         + "（" + balance + "，双方损失 " + playerLossPercent + "% / " + defenderLossPercent + "%）"
                         + (playerDied ? "，玩家文明灭亡" : annexed ? "，灭其国并吞并该地" : ""),
                 RARITY_ATTACK);
@@ -476,7 +630,7 @@ public class ChatController {
      * 核打击 targetCivIds 里的每个文明：人口清零，所占区域全部变无主（ownerCivId = 0）。
      * 门槛看世界总科技（对齐 EvolutionEngine.ERA_THRESHOLDS[11]，ERAS[11] = "核子时代"），不看玩家自己的科技。
      */
-    private String doNuke(Civilization player, List<Long> targetCivIds) {
+    private String doNuke(Civilization player, List<Long> targetCivIds, List<CombatEvent> combatEvents) {
         int tech = worldTech();
         if (tech < NUKE_TECH_REQUIRED) {
             return "世界还没进入核子时代（需要总科技 " + NUKE_TECH_REQUIRED + "，当前 " + tech + "）";
@@ -499,12 +653,23 @@ public class ChatController {
                 continue;
             }
             // 先把目标占的区域全部改为无主，再从它的领土表里摘掉
-            for (Integer regionId : new ArrayList<>(victim.getTerritory())) {
+            List<Integer> nukedRegions = new ArrayList<>(victim.getTerritory());
+            for (Integer regionId : nukedRegions) {
                 Region owned = world.getRegionMap().get(regionId);
                 if (owned != null) {
                     owned.setOwnerCivId(Region.UNOWNED);
                 }
                 victim.removeRegion(regionId);
+            }
+            if (nukedRegions.isEmpty()) {
+                // 已经没有领土了也记一条（regionId = 0），前端照样播核爆
+                combatEvents.add(new CombatEvent((int) player.getId(), (int) victim.getId(), 0, "nuke"));
+            } else {
+                // 每块易主的区域各记一条，前端可以把每个区域都炸一遍
+                for (Integer regionId : nukedRegions) {
+                    combatEvents.add(new CombatEvent((int) player.getId(), (int) victim.getId(),
+                            regionId, "nuke"));
+                }
             }
             victim.setPopulation(0L);
             record(year, EventType.EXTINCTION, victim.getName() + "遭核打击，彻底毁灭",
@@ -512,11 +677,18 @@ public class ChatController {
             hit.add(victim.getName());
         }
 
+        // 核打击是最大的混乱源：每灭掉一个国家 +15（单条指令上限由引擎钳制）
+        if (engine != null && !hit.isEmpty()) {
+            engine.addChaos(15 * hit.size(), "核打击");
+        }
+
         if (hit.isEmpty()) {
             return "没有可以核平的目标：" + String.join("、", skipped) + "。";
         }
         record(year, EventType.PLAYER_COMMAND,
-                player.getName() + "对" + String.join("、", hit) + "发动核打击", RARITY_NUKE);
+                "【" + player.getName() + "】（" + player.personalityLabel() + "）对【"
+                        + String.join("、", hit) + "】发动核打击。",
+                RARITY_NUKE);
 
         String names = String.join("、", hit);
         StringBuilder message = new StringBuilder();
@@ -527,11 +699,15 @@ public class ChatController {
         return message.toString();
     }
 
-    /** 发展科技。 */
+    /** 发展科技：科技 +N，顺带攒一点科学点，混乱度 -1。 */
     private String doDevelopTech(Civilization player) {
-        player.setTechLevel(player.getTechLevel() + DEVELOP_TECH_GAIN);
+        player.gainTech(DEVELOP_TECH_GAIN);
+        if (engine != null) {
+            engine.addChaos(-1, "发展科技");
+        }
+        player.addPoints(Civilization.POINT_SCIENCE, DEVELOP_TECH_SCIENCE_GAIN);
         String message = "你投入资源发展科技，科技 +" + DEVELOP_TECH_GAIN
-                + "（当前 " + player.getTechLevel() + "）。";
+                + "（当前科技 " + player.getTechLevel() + "，科学点 +" + DEVELOP_TECH_SCIENCE_GAIN + "）。";
         record(world.getYear(), EventType.PLAYER_COMMAND,
                 player.getName() + "集中资源发展科技（科技 +" + DEVELOP_TECH_GAIN + "）", RARITY_PEACEFUL);
         return message;
@@ -540,59 +716,59 @@ public class ChatController {
     // ==================== 科技树指令 ====================
 
     /**
-     * 研究某个科技：按中文名找节点，前置没解锁 / 已经解锁 / 正在研究都给提示，
-     * 否则把玩家文明的研究项目换成它（进度从 0 起）。
+     * 研究某个科技：按中文名找节点。已解锁 / 前置没解锁 / 同互斥组已占 / 科技点不够都给提示，
+     * 够就花科技点解锁，并返回剩余科技点。
      */
     private String doResearch(Civilization player, String target) {
         if (target == null || target.isBlank()) {
-            return "没听清要研究什么。可以说「研究青铜武器」「研究火药」，或者问「有什么能研究」。";
+            return "没听清要研究什么。可以说「研究火器」「研究银行」，或者问「有什么能研究」。";
         }
         TechNode node = TechTree.getByName(target);
         if (node == null) {
             return "科技树里没有「" + target.trim() + "」。问一句「有什么能研究」可以看当前能研究的方向。";
         }
         if (player.hasUnlockedTech(node.id())) {
-            return "【" + node.name() + "】已经研究过了。";
+            return "【" + node.name() + "】已经解锁过了。";
         }
         if (node.prerequisite() != null && !player.hasUnlockedTech(node.prerequisite())) {
             TechNode prerequisite = TechTree.getById(node.prerequisite());
             String prereqName = prerequisite != null ? prerequisite.name() : node.prerequisite();
             return "需要先解锁 " + prereqName + "。";
         }
-        if (node.id().equals(player.getCurrentResearchId())) {
-            return "正在研究【" + node.name() + "】，已积累 "
-                    + Math.round(player.getResearchProgress()) + "/" + node.cost() + " 点。";
+        // 同组惩罚：同 exclusiveGroup 里已选过别的节点时，每种资源的实际消耗 ×2
+        Map<String, Integer> costs = TechTree.actualCosts(node, player);
+        if (!TechTree.canAfford(player, costs)) {
+            return "资源点不够（需要 " + TechTree.costText(costs)
+                    + "，当前 " + TechTree.costText(player.pointMap()) + "）。";
         }
-        player.setCurrentResearchId(node.id());
-        player.setResearchProgress(0);
+        TechTree.pay(player, costs);
+        TechTree.unlock(player, node);
+        // 解锁奖励：科技 +techBonus
+        player.setTechLevel(player.getTechLevel() + node.techBonus());
+        // 闷头搞研究属于内政，混乱度 -1
+        if (engine != null) {
+            engine.addChaos(-1, "内政");
+        }
         record(world.getYear(), EventType.PLAYER_COMMAND,
-                player.getName() + "开始研究【" + node.name() + "】", RARITY_PEACEFUL);
-        return "开始研究【" + node.name() + "】（需要 " + node.cost() + " 点，当前科技每年推进 "
-                + formatProgress(player) + " 点）。";
+                player.getName() + "解锁了【" + node.name() + "】", RARITY_PEACEFUL);
+        return "已解锁【" + node.name() + "】，剩余 " + TechTree.costText(player.pointMap()) + "。";
     }
 
-    /** 列出当前可研究的科技：按分支分组，标出成本与进行中的进度。 */
+    /** 列出当前可研究的科技（按分支分组，标出花费）与当前科技点。 */
     private String doListResearch(Civilization player) {
         List<TechNode> available = TechTree.getAvailable(player);
-        StringBuilder sb = new StringBuilder();
-        if (player.getCurrentResearchId() != null) {
-            TechNode current = TechTree.getById(player.getCurrentResearchId());
-            if (current != null) {
-                sb.append("正在研究【").append(current.name()).append("】")
-                        .append(Math.round(player.getResearchProgress())).append('/')
-                        .append(current.cost()).append(" 点。\n");
-            }
-        }
         if (available.isEmpty()) {
-            return sb + "当前没有可研究的科技：能解锁的都已经解锁了。";
+            return "当前没有可研究的科技：能解锁的都已经解锁了。";
         }
-        sb.append("当前可研究（共 ").append(available.size()).append(" 项）：\n");
+        StringBuilder sb = new StringBuilder();
+        sb.append("当前可研究（共 ").append(available.size()).append(" 项，你有 ")
+                .append(TechTree.costText(player.pointMap())).append("）：\n");
         for (String branch : TechTree.branches()) {
             List<String> names = new ArrayList<>();
             for (TechNode node : available) {
                 if (node.branch().equals(branch)) {
-                    String mark = node.id().equals(player.getCurrentResearchId()) ? "（研究中）" : "";
-                    names.add(node.name() + "（" + node.cost() + " 点）" + mark);
+                    names.add(node.name() + "（" + TechTree.costText(TechTree.actualCosts(node, player))
+                            + (TechTree.isPenalized(node, player) ? "，同组已选 ×2" : "") + "）");
                 }
             }
             if (!names.isEmpty()) {
@@ -600,14 +776,19 @@ public class ChatController {
                         .append(String.join("、", names)).append('\n');
             }
         }
+        // 根节点等不属于四大分支的（分支名不在 branches 里）单独列一行
+        List<String> others = new ArrayList<>();
+        for (TechNode node : available) {
+            if (!TechTree.branches().contains(node.branch())) {
+                others.add(node.name() + "（" + TechTree.costText(TechTree.actualCosts(node, player)) + "）");
+            }
+        }
+        if (!others.isEmpty()) {
+            sb.append("- 基础：").append(String.join("、", others)).append('\n');
+        }
         sb.append("已解锁 ").append(player.getUnlockedTechs().size()).append(" 项。"
-                + "说「研究某个科技名」即可立项。");
+                + "说「研究某个科技名」即可花资源点解锁。");
         return sb.toString();
-    }
-
-    /** 玩家文明每年能推进的研究进度（EvolutionEngine 的口径：techLevel × 0.1）。 */
-    private String formatProgress(Civilization player) {
-        return String.format("%.1f", player.getTechLevel() * 0.1);
     }
 
     /** 扩张：占一块与现有领土接壤的无主区域。 */
@@ -686,6 +867,37 @@ public class ChatController {
 
     // ==================== 自由行动（free） ====================
 
+    /** 命中说法里的能力门槛；没命中返回 null（= 这件事不受科技门槛限制）。 */
+    private static CapabilityGate matchCapabilityGate(String text) {
+        if (text == null || text.isBlank()) {
+            return null;
+        }
+        for (CapabilityGate gate : CAPABILITY_GATES) {   // 已按门槛从高到低排列
+            for (String keyword : gate.keywords()) {
+                if (text.contains(keyword)) {
+                    return gate;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 后端终判能力门槛：命中门槛且玩家未解锁对应科技树节点时返回失败提示，够则返回 null（放行）。
+     */
+    private static String capabilityGateFailure(Civilization player, String text) {
+        CapabilityGate gate = matchCapabilityGate(text);
+        if (gate == null) {
+            return null;
+        }
+        if (player.getUnlockedTechs().contains(gate.requiredNodeId())) {
+            return null;
+        }
+        TechNode node = TechTree.getById(gate.requiredNodeId());
+        String nodeName = node != null ? node.name() : gate.label();
+        return "你的文明还没解锁【" + nodeName + "】（需要先研究对应的科技），这件事暂时做不到。";
+    }
+
     /**
      * 自由行动：玩家说什么都能尝试。AI 已按能力门槛判断可行性，这里只负责把结果落地。
      *
@@ -704,10 +916,16 @@ public class ChatController {
 
         int year = world.getYear();
 
-        // tech → 玩家文明（int，不低于 0）
+        // tech → 玩家文明（int，不低于 0）；增长时科技点同额增长
         if (effects[0] != 0) {
             long tech = (long) player.getTechLevel() + effects[0];
-            player.setTechLevel((int) Math.max(0, Math.min(Integer.MAX_VALUE, tech)));
+            int after = (int) Math.max(0, Math.min(Integer.MAX_VALUE, tech));
+            int delta = after - player.getTechLevel();
+            if (delta > 0) {
+                player.gainTech(delta);
+            } else if (delta < 0) {
+                player.setTechLevel(after);
+            }
         }
         // population → 玩家文明（long，不低于 0）
         if (effects[1] != 0) {
@@ -801,6 +1019,229 @@ public class ChatController {
         return Math.max(-limit, Math.min(limit, value));
     }
 
+    // ==================== 外交回应（action=diplomacy） ====================
+
+    /** 当前世界混乱度（前端进度条轮询这个接口，0~100）。 */
+    @GetMapping("/chaos")
+    public ChaosState chaos() {
+        return new ChaosState(engine == null ? 0 : engine.getChaosLevel());
+    }
+
+    /** 混乱度对外视图。 */
+    public record ChaosState(int chaosLevel) {
+    }
+
+    /** 当前待回应的 AI 外交（前端「外交提示条」轮询这个接口）。没有时 pending=false。 */
+    @GetMapping("/diplomacy")
+    public DiplomacyState diplomacy() {
+        EvolutionEngine.PendingDiplomacy pending = engine == null ? null : engine.getPendingDiplomacy();
+        if (pending == null) {
+            return DiplomacyState.none();
+        }
+        // prompt 已经拼好（如「文明-3请求结盟」），前端直接接在「有人在等你回应：」后面
+        return new DiplomacyState(true, pending.civId(), pending.civName(), pending.action(),
+                pending.actionLabel(), pending.civName() + pending.summary(), pending.year());
+    }
+
+    /**
+     * 回应「最近一条」待处理的 AI 外交。
+     *
+     * <p>针对哪条外交不由 AI 决定，而是取引擎里挂起的那条；AI 只负责把玩家的话归类成
+     * 同意 / 拒绝 / 开战（stance），识别不出时用关键词兜底。
+     */
+    private String doDiplomacy(Civilization player, String stance, String text,
+            List<CombatEvent> combatEvents) {
+        if (engine == null) {
+            return "AI 外交未启用。";
+        }
+        EvolutionEngine.PendingDiplomacy pending = engine.getPendingDiplomacy();
+        if (pending == null) {
+            return "当前没有待回应的外交。";
+        }
+        Civilization envoy = findCivilization(pending.civId());
+        if (envoy == null || envoy.getPopulation() <= 0) {
+            engine.clearDiplomacy();
+            return pending.civName() + "已经灭亡，这条外交作废。";
+        }
+
+        EvolutionEngine.DiplomacyAction action = parseDiplomacyAction(pending.action());
+        String resolved = normalizeStance(stance, text);
+        int year = world.getYear();
+        String civName = envoy.getName();
+
+        String result;
+        if (STANCE_WAR.equals(resolved)) {
+            // 玩家选择开战：无论对方提的是什么，直接开打，关系恶化
+            result = "你对" + civName + "开战。" + doAttack(player, List.of(envoy.getId()), combatEvents);
+            rememberBothWays(player, envoy, year, "开战",
+                    "我们对" + civName + "开战", player.getName() + "对我们开战", -1.0, DIPLOMACY_WAR_RELATION);
+        } else if (STANCE_AGREE.equals(resolved)) {
+            result = agreeDiplomacy(player, envoy, action, combatEvents);
+        } else {
+            result = rejectDiplomacy(player, envoy, action);
+        }
+
+        engine.clearDiplomacy();
+        record(year, EventType.PLAYER_COMMAND,
+                "【" + player.getName() + "】回应【" + civName + "】的外交（" + pending.actionLabel() + "）："
+                        + (STANCE_WAR.equals(resolved) ? "开战" : STANCE_AGREE.equals(resolved) ? "同意" : "拒绝"),
+                RARITY_PEACEFUL);
+        return result;
+    }
+
+    /** 同意对方的提议：按动作类型执行正面结果。 */
+    private String agreeDiplomacy(Civilization player, Civilization envoy,
+            EvolutionEngine.DiplomacyAction action, List<CombatEvent> combatEvents) {
+        int year = world.getYear();
+        String civName = envoy.getName();
+        String playerName = player.getName();
+        // 和平外交（结盟 / 送礼 / 联姻 / 通商 / 援助）让世界缓和一点；宣战档不算
+        if (engine != null && action != EvolutionEngine.DiplomacyAction.WAR) {
+            engine.addChaos(-3, action.getLabel());
+        }
+        switch (action) {
+            case ALLIANCE -> {
+                rememberBothWays(player, envoy, year, "结盟",
+                        "我们与" + civName + "结盟", "我们与" + playerName + "结盟", 1.0, 30);
+                return "你接受了" + civName + "的结盟请求，双方关系 +30。";
+            }
+            case MARRIAGE -> {
+                rememberBothWays(player, envoy, year, "联姻",
+                        "我们与" + civName + "联姻", "我们与" + playerName + "联姻", 1.0, 30);
+                return "你与" + civName + "结为姻亲，双方关系 +30。";
+            }
+            case GIFT -> {
+                rememberBothWays(player, envoy, year, "受礼",
+                        "我们收下了" + civName + "的礼物", "我们向" + playerName + "送了礼", 0.5, 20);
+                return "你收下了" + civName + "送来的礼物，双方关系 +20。";
+            }
+            case TRADE -> {
+                // 同意通商 → 双方资源 +5%
+                bumpResource(player, DIPLOMACY_TRADE_RESOURCE_GAIN);
+                bumpResource(envoy, DIPLOMACY_TRADE_RESOURCE_GAIN);
+                rememberBothWays(player, envoy, year, "通商",
+                        "我们与" + civName + "通商", "我们与" + playerName + "通商", 0.5, 5);
+                return "你与" + civName + "开通商路，双方资源各 +5%。";
+            }
+            case AID -> {
+                // 援助对方：付出世界资源，换来关系
+                if (engine != null) {
+                    engine.restoreState(engine.getFood(),
+                            Math.max(0, engine.getResources() * DIPLOMACY_AID_RESOURCE_COST),
+                            engine.currentEraIndex());
+                }
+                rememberBothWays(player, envoy, year, "援助",
+                        "我们援助了" + civName, "我们得到了" + playerName + "的援助", 1.0, 15);
+                return "你向" + civName + "伸出援手，双方关系 +15（世界资源 -5%）。";
+            }
+            case REQUEST, PROBE, THREATEN, ULTIMATUM ->
+                    // 让步：满足对方的试探 / 威胁 / 最后通牒，关系略回暖，但本质是被拿捏
+                    rememberBothWays(player, envoy, year, "让步",
+                            "我们对" + civName + "作出让步", "我们对" + playerName + "施压得逞", 0.5, 10);
+            case WAR -> {
+                // 对方已宣战，玩家选择迎战
+                return "你选择迎战。" + doAttack(player, List.of(envoy.getId()), combatEvents);
+            }
+            default -> {
+                return "你同意了" + civName + "的提议。";
+            }
+        }
+        return "你满足了" + civName + "的要求，双方关系 +10。";
+    }
+
+    /** 拒绝对方的提议：按动作类型扣关系（给好处类的只扣 5，其余扣 10）。 */
+    private String rejectDiplomacy(Civilization player, Civilization envoy,
+            EvolutionEngine.DiplomacyAction action) {
+        int year = world.getYear();
+        String civName = envoy.getName();
+        int penalty = switch (action) {
+            case TRADE, GIFT, AID -> DIPLOMACY_MILD_REJECT;
+            default -> DIPLOMACY_HARSH_REJECT;
+        };
+        rememberBothWays(player, envoy, year, "拒绝",
+                "我们拒绝了" + civName, civName + "被" + player.getName() + "拒绝", -1.0, penalty);
+        return "你拒绝了" + civName + "，双方关系 " + penalty + "。";
+    }
+
+    /**
+     * 双方同时记一笔同类记忆，并各自把对对方的关系调整 {@code relationDelta}。
+     *
+     * <p>注意 {@link Civilization#remember} 本身会按 {@code sentiment × 10} 顺手改关系，
+     * 这里把这部分算进总量，差多少再补 {@code adjustRelation}，保证关系总变化正好等于 relationDelta。
+     */
+    private void rememberBothWays(Civilization player, Civilization other, int year, String type,
+            String playerDesc, String otherDesc, double sentiment, int relationDelta) {
+        exchangeMemory(player, other, year, type, playerDesc, sentiment, relationDelta);
+        exchangeMemory(other, player, year, type, otherDesc, sentiment, relationDelta);
+    }
+
+    /** 记一笔记忆并让 actor 对 target 的关系恰好变化 totalDelta。 */
+    private void exchangeMemory(Civilization actor, Civilization target, int year, String type,
+            String description, double sentiment, int totalDelta) {
+        double clamped = Math.max(-1.0, Math.min(1.0, sentiment));
+        int fromMemory = (int) Math.round(clamped * 10);
+        actor.remember(new Memory(year, type, (int) target.getId(), description, clamped));
+        int rest = totalDelta - fromMemory;
+        if (rest != 0) {
+            actor.adjustRelation(target.getId(), rest);
+        }
+    }
+
+    /** 把文明的「资源」柱 +delta（四柱 0~100，setter 自带夹取）。 */
+    private static void bumpResource(Civilization civilization, int delta) {
+        civilization.setResource(civilization.getResource() + delta);
+    }
+
+    /** 还原挂起外交的动作枚举；认不出时退回「提要求」。 */
+    private static EvolutionEngine.DiplomacyAction parseDiplomacyAction(String name) {
+        if (name == null) {
+            return EvolutionEngine.DiplomacyAction.REQUEST;
+        }
+        try {
+            return EvolutionEngine.DiplomacyAction.valueOf(name.trim());
+        } catch (IllegalArgumentException e) {
+            return EvolutionEngine.DiplomacyAction.REQUEST;
+        }
+    }
+
+    /**
+     * 归一化玩家态度：优先用 AI 给的 stance（agree / reject / war），
+     * 认不出时按原话关键词兜底（开战 &gt; 拒绝 &gt; 同意，先判「不」避免「不同意」被当成同意）。
+     */
+    private static String normalizeStance(String stance, String text) {
+        String s = stance == null ? "" : stance.trim().toLowerCase();
+        if (STANCE_AGREE.equals(s) || STANCE_REJECT.equals(s) || STANCE_WAR.equals(s)) {
+            return s;
+        }
+        String t = text == null ? "" : text.trim();
+        if (t.contains("开战") || t.contains("宣战") || t.contains("进攻") || t.contains("出兵")) {
+            return STANCE_WAR;
+        }
+        if (t.contains("拒绝") || t.contains("不") || t.contains("否")) {
+            return STANCE_REJECT;
+        }
+        if (t.contains("同意") || t.contains("接受") || t.contains("答应")
+                || t.contains("可以") || t.contains("好")) {
+            return STANCE_AGREE;
+        }
+        // 兜底：没听清就当拒绝（不开打、也不白送好处）
+        return STANCE_REJECT;
+    }
+
+    /**
+     * 待回应外交的对外视图。
+     *
+     * @param pending 是否有待回应外交
+     * @param prompt  提示条正文（如「文明-3请求结盟」）
+     */
+    public record DiplomacyState(boolean pending, long civId, String civName, String action,
+            String actionLabel, String prompt, int year) {
+
+        static DiplomacyState none() {
+            return new DiplomacyState(false, 0, null, null, null, null, 0);
+        }
+    }
+
     /** 目标区域是否与玩家现有领土接壤。 */
     private boolean bordersPlayerTerritory(Civilization player, Region target) {
         for (Integer ownedId : player.getTerritory()) {
@@ -866,7 +1307,7 @@ public class ChatController {
     private String buildPrompt(String text, Civilization player) {
         StringBuilder prompt = new StringBuilder();
         prompt.append("你是星球演化模拟器里的指令翻译器。把玩家的一句话翻译成 JSON，只输出 JSON，不要解释，不要代码块。\n")
-                .append("格式：{\"action\":\"ask|attack|nuke|expand|develop_tech|research|list_research|free\",\"scope\":\"ALL|STRONGEST|WEAKEST|NEIGHBOR|SELF|ONE|UNKNOWN\",\"target\":\"具体名字（仅 scope=ONE 时填）\",\"reply\":\"回答内容（仅 action=ask 时填）\",\"failed\":false,\"reason\":\"仅 free 且做不到时填\",\"narrative\":\"仅 free 成功时填\",\"effects\":{\"tech\":0,\"population\":0,\"food\":0,\"resources\":0},\"newRegions\":[],\"event\":\"仅 free 成功时填\",\"pillars\":{\"science\":0,\"welfare\":0,\"resource\":0,\"military\":0},\"raw\":\"玩家原话\"}\n")
+                .append("格式：{\"action\":\"ask|attack|nuke|expand|develop_tech|research|list_research|diplomacy|free\",\"scope\":\"ALL|STRONGEST|WEAKEST|NEIGHBOR|SELF|ONE|UNKNOWN\",\"target\":\"具体名字（仅 scope=ONE 时填）\",\"reply\":\"回答内容（仅 action=ask 时填）\",\"stance\":\"agree|reject|war（仅 action=diplomacy 时填）\",\"failed\":false,\"reason\":\"仅 free 且做不到时填\",\"narrative\":\"仅 free 成功时填\",\"effects\":{\"tech\":0,\"population\":0,\"food\":0,\"resources\":0},\"newRegions\":[],\"event\":\"仅 free 成功时填\",\"pillars\":{\"science\":0,\"welfare\":0,\"resource\":0,\"military\":0},\"raw\":\"玩家原话\"}\n")
                 .append("action：ask=玩家在问问题，你在 reply 里直接回答；attack=出兵攻打某文明；nuke=核打击某文明；expand=占领相邻无主区域；develop_tech=发展科技；research=研究科技树上的某个科技；list_research=查看当前能研究什么；free=玩家在做其他任何事（默认动作，绝不能输出 unknown）。\n")
                 .append("scope 怎么填——AI 只输出范围标签，不再输出 id 列表，id 由后端展开：\n")
                 .append("- ALL = 全世界/所有人/所有文明/全部（expand 时指所有能连到的无主区域）\n")
@@ -890,7 +1331,12 @@ public class ChatController {
                 .append("- 例外：问可研究科技的句子即使带疑问词（有什么 / 什么 / 哪些 / 能……吗），也一律用 list_research，不要用 ask、也不要用 research\n")
                 .append("- research 的 target 必须照抄下面「可研究」里给出的科技名，绝对不要编造名字；玩家想要的科技不在里面时，仍旧输出 action=research 和玩家说的名字，后端会给出提示\n")
                 .append("- list_research 只是查看清单，pillars 四根柱子全给 0\n\n")
-                .append("action：attack=出兵攻打某文明；nuke=核打击某文明；expand=占领相邻无主区域；develop_tech=发展科技；research=研究某个科技；list_research=查看可研究的科技；free=其他一切情况（默认，绝不能输出 unknown）。\n")
+                .append("diplomacy（回应外交）——只在「世界状态」里出现「待回应的外交」时才可能用到：\n")
+                .append("- 玩家在回应那条外交时（同意 / 接受 / 答应 / 拒绝 / 不 / 开战 / 宣战）→ action=diplomacy\n")
+                .append("- stance 只填 agree（同意 / 接受 / 答应）、reject（拒绝 / 不）、war（开战 / 宣战）三者之一\n")
+                .append("- 针对哪条外交、对方是谁，全由后端取「最近一条」决定，你只填 stance，scope 留空或 UNKNOWN、target 留空\n")
+                .append("- 世界状态里没有「待回应的外交」时不要输出 diplomacy\n\n")
+                .append("action：attack=出兵攻打某文明；nuke=核打击某文明；expand=占领相邻无主区域；develop_tech=发展科技；research=研究某个科技；list_research=查看可研究的科技；diplomacy=回应最近一条待处理的外交；free=其他一切情况（默认，绝不能输出 unknown）。\n")
                 .append("scope 列出的含义：ALL=全世界，STRONGEST=最强的，WEAKEST=最弱的，NEIGHBOR=旁边的/邻居，ONE=指定名字，SELF=自己，UNKNOWN=看不懂。\n")
                 .append("- 绝对不要输出文明 id 列表；AI 只负责输出 scope 和 target（当 scope=ONE 时），后端由 expandScope 展开具体 id。\n\n")
                 .append("- attack 只能打与玩家接壤的文明；nuke 需要世界总科技 ≥ 7000\n\n")
@@ -902,10 +1348,21 @@ public class ChatController {
                 .append("  · 「研究 XX」→ research（只带科技名时）\n")
                 .append("  · 明确提问（带 吗 / 呢 / 怎么 / 为什么 / 谁 / 什么）→ ask\n")
                 .append("- 其他任何情况，一律 action=free。free 是默认选项，不是例外；绝不要返回 unknown，也不要硬套成 expand。\n")
-                .append("free 怎么判断能不能做——先查这张能力门槛表（拿玩家当前科技和「需要值」比）：\n")
-                .append("  火 / 工具 / 部落 = 0；农业 / 文字 / 房屋 = 100；冶金 / 城市 / 长城 = 300；火药 / 大航海 = 800；\n")
-                .append("  蒸汽机 / 铁路 = 2000；电力 / 汽车 = 4000；核弹 / 火箭 = 5000；卫星 / 空间站 = 7000；星际航行 / 月球基地 = 10000。\n")
-                .append("  效果必须符合当前时代：石器时代飞不出地球，核子时代才可以。\n")
+                .append("free 怎么判断能不能做——先查这张能力门槛表（检查玩家是否已解锁对应科技树节点）：\n")
+                .append("  星际航行/月球基地/殖民火星 → 需要解锁「火箭」（太空分支）\n")
+                .append("  卫星/空间站 → 需要解锁「卫星」（太空分支）\n")
+                .append("  核弹/核武器/核打击 → 需要解锁「核弹」（军事分支）\n")
+                .append("  火箭/飞出地球/登月 → 需要解锁「火箭」（太空分支）\n")
+                .append("  电力/发电/汽车/内燃机 → 需要解锁「自动化」（经济分支）\n")
+                .append("  蒸汽机/铁路/火车 → 需要解锁「铁路」（经济分支）\n")
+                .append("  火药/大航海/远洋/印刷 → 需要解锁「指南针」（太空分支）\n")
+                .append("  冶金/钢铁/城市/长城/铸剑 → 需要解锁「工厂」（经济分支）\n")
+                .append("  农业/灌溉 → 需要解锁「农业改良」（经济分支）\n")
+                .append("  文字/房屋/车轮 → 需要解锁「哲学」（社会分支）\n")
+                .append("  其他行动不受科技门槛限制，可以直接尝试。\n")
+                .append("  效果必须符合当前时代：石器时代没有火箭节点，飞不出地球。\n")
+                .append("  · 这张表只作参考，最终以后端判定为准：后端会检查玩家的已解锁科技列表，")
+                .append("已解锁节点一定放行、未解锁一定失败，所以你不用担心判断错误。\n")
                 .append("free 的两种输出：\n")
                 .append("  1) 科技不够（做不到）→ {\"action\":\"free\",\"failed\":true,\"reason\":\"你的文明还没掌握XX技术（需要科技 N，当前 M）\"}\n")
                 .append("  2) 科技够（做得到）→ {\"action\":\"free\",\"failed\":false,\"narrative\":\"一两句话描述发生了什么\",\"effects\":{\"tech\":0,\"population\":0,\"food\":0,\"resources\":0},\"newRegions\":[],\"event\":\"事件描述\"}\n")
@@ -915,10 +1372,10 @@ public class ChatController {
                 .append("- newRegions：只有真的开辟了新地盘才填（例如「飞出地球」→ [\"近地轨道\",\"月球\"]），否则留空数组 []。\n")
                 .append("- 明确告诉 AI：玩家说什么就用合理的代价和结果回应。不要拒绝，不要说「做不到」（只有科技不够时用 failed+reason 说明原因）。\n")
                 .append("- free 例子：\n")
-                .append("  · 石器时代说「飞出地球」→ {\"action\":\"free\",\"failed\":true,\"reason\":\"你的文明还没掌握火箭技术（需要科技 5000，当前 45）\"}\n")
-                .append("  · 核子时代说「飞出地球」→ {\"action\":\"free\",\"failed\":false,\"narrative\":\"你的火箭冲出大气层，人类第一次进入太空。\",\"effects\":{\"tech\":500,\"population\":0,\"food\":0,\"resources\":-500000},\"newRegions\":[\"近地轨道\",\"月球\"],\"event\":\"发射火箭，挺进太空\"}\n")
-                .append("  · 「建长城」（需要科技 300）→ 成功，effects.population=-50000，effects.resources=-200000，event:\"建造了长城\"\n")
-                .append("  · 「发明文字」（需要科技 100）→ 成功，effects.tech=100，event:\"发明了文字\"\n")
+                .append("  · 石器时代说「飞出地球」→ {\"action\":\"free\",\"failed\":true,\"reason\":\"你的文明还没解锁【火箭】（需要先研究对应的科技），这件事暂时做不到。\"}\n")
+                .append("  · 点了火箭科技后说「飞出地球」→ {\"action\":\"free\",\"failed\":false,\"narrative\":\"你的火箭冲出大气层，人类第一次进入太空。\",\"effects\":{\"tech\":500,\"population\":0,\"food\":0,\"resources\":-500000},\"newRegions\":[\"近地轨道\",\"月球\"],\"event\":\"发射火箭，挺进太空\"}\n")
+                .append("  · 「建长城」（需要工厂节点）→ 成功，effects.population=-50000，effects.resources=-200000，event:\"建造了长城\"\n")
+                .append("  · 「发明文字」（需要哲学节点）→ 成功，effects.tech=100，event:\"发明了文字\"\n")
                 .append("  · 「教猴子用火」→ 自己编一个合理结果\n")
                 .append("  · 「和文明-3 联姻」→ 自己编一个合理结果\n\n")
                 .append("pillars 怎么填——玩家王国有四根柱子（参考《王权》），每根 0~100，初始都是 50。\n")
@@ -954,7 +1411,9 @@ public class ChatController {
         prompt.append("- 可扩张的相邻无主区域：").append(describeExpandable(player)).append('\n');
         prompt.append("- 玩家科技树：已解锁 ").append(player.getUnlockedTechs().size()).append(" 项")
                 .append(player.getUnlockedTechs().isEmpty() ? "" : describeUnlockedTechs(player)).append('\n');
-        prompt.append("- 玩家正在研究：").append(describeCurrentResearch(player)).append('\n');
+        prompt.append("- 玩家五种资源点：").append(TechTree.costText(player.pointMap()))
+                .append("（解锁科技按类型扣点：军事节点吃军事点、社会节点吃文化点、太空节点吃科学点、"
+                        + "经济节点吃工业/农业点；花不起后端会提示「资源点不够」）\n");
         prompt.append("- 玩家可研究（research 的 target 只能用这些名字）：")
                 .append(describeAvailableResearch(player)).append('\n');
         prompt.append("- 世界总科技：").append(worldTech())
@@ -962,6 +1421,15 @@ public class ChatController {
         prompt.append("- 存活文明总数：").append(aliveCivCountExcludingPlayer(player))
                 .append("（不含玩家，人口>0）\n");
         prompt.append("- 世界总人口：").append(totalPopulation()).append('\n');
+        // 待回应的外交：让 AI 知道玩家可能在回应它（有才写，没有就不占上下文）
+        if (engine != null) {
+            EvolutionEngine.PendingDiplomacy pending = engine.getPendingDiplomacy();
+            if (pending != null) {
+                prompt.append("- 待回应的外交：").append(pending.civName())
+                        .append("（id=").append(pending.civId()).append("）").append(pending.actionLabel())
+                        .append("，事件：").append(pending.message()).append('\n');
+            }
+        }
         prompt.append("- 存活文明：\n").append(describeCivs(player));
         prompt.append("- 最近事件（最新在前）：\n").append(describeRecentEvents());
         prompt.append('\n').append("玩家原话：").append(text);
@@ -1008,15 +1476,6 @@ public class ChatController {
             first = false;
         }
         return sb.append('）').toString();
-    }
-
-    /** 玩家正在研究的科技与进度，供模型回答「我在研究什么」。 */
-    private String describeCurrentResearch(Civilization player) {
-        TechNode current = TechTree.getById(player.getCurrentResearchId());
-        if (current == null) {
-            return "（无）";
-        }
-        return "【" + current.name() + "】" + Math.round(player.getResearchProgress()) + "/" + current.cost() + " 点";
     }
 
     /** 当前可研究的科技名清单（按分支分组），research 的 target 只能从这里取。 */
@@ -1245,7 +1704,28 @@ public class ChatController {
     public record CommandRequest(String text) {
     }
 
-    /** 响应体：成功给 result，失败给 error。 */
-    public record CommandResult(String result, String error) {
+    /**
+     * 一场具体战斗（供前端直接播动画，不必再靠对比区域归属变化去猜）。
+     *
+     * @param attackerCivId 进攻方文明 id（一般都是玩家 1）
+     * @param defenderCivId 防守方文明 id
+     * @param regionId      交战/易主的区域 id（0 表示该文明已无领土）
+     * @param type          类型：attack / nuke
+     */
+    public record CombatEvent(int attackerCivId, int defenderCivId, int regionId, String type) {
+    }
+
+    /** 响应体：成功给 result，失败给 error；combatEvents 是本次指令产生的战斗列表；chaosChange 是混乱度变化文本。 */
+    public record CommandResult(String result, String error, List<CombatEvent> combatEvents, String chaosChange) {
+
+        /** 兼容原调用点的两参构造：没有战斗、没有混乱度变化。 */
+        public CommandResult(String result, String error) {
+            this(result, error, List.of(), null);
+        }
+
+        /** 兼容原调用点的三参构造：没有混乱度变化。 */
+        public CommandResult(String result, String error, List<CombatEvent> combatEvents) {
+            this(result, error, combatEvents, null);
+        }
     }
 }
