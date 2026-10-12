@@ -48,6 +48,14 @@ public class WorldController {
     private static final int SKIP_ERA_MAX_STEPS = 5;
     /** 玩家文明固定为 id = 1（与 ChatController / EvolutionEngine 一致），四柱从它取。 */
     private static final long PLAYER_CIV_ID = 1L;
+    /** 分配文明 id 时的向上扫描上限（正常远用不到，兜底防死循环）。 */
+    private static final int MAX_CIV_ID_SCAN = 10000;
+
+    /**
+     * sessionId 认不出玩家时的统一提示。后端重启会清空内存里的玩家表（sessionId 只存在内存里），
+     * 于是浏览器 localStorage 里的旧 sessionId 就"失效"了。前端收到这句话要清掉本地会话、重新加入。
+     */
+    private static final String SESSION_EXPIRED_MESSAGE = "登录已失效，请刷新页面重新加入";
     /** 玩家指令事件的稀有度（与 ChatController.RARITY_PEACEFUL 一致）。 */
     private static final int RARITY_PEACEFUL = 50;
 
@@ -73,8 +81,14 @@ public class WorldController {
         this.voteService = voteService;
     }
 
+    /**
+     * 世界状态。
+     *
+     * @param sessionId 可选：带上就按「该玩家当前控制的文明」返回四柱 / 概览；
+     *                  不带则退回文明 id=1（兼容旧前端与探活脚本）
+     */
     @GetMapping
-    public WorldStateResponse getWorld() {
+    public WorldStateResponse getWorld(@RequestParam(required = false) String sessionId) {
         Planet planet = world.getPlanet();
 
         List<WorldStateResponse.CivilizationView> civilizations = new ArrayList<>();
@@ -93,9 +107,9 @@ public class WorldController {
                 planet.getTemperature(), planet.getHabitability(), engine.getFood(), engine.getResources(),
                 population, techTotal, world.aliveCivilizationCount(), world.extinctCivilizationCount(),
                 engine.currentEra());
-        // 四柱只属于玩家文明（id=1）：玩家不存在或已灭亡时给 null，前端留空
+        // 四柱属于「该玩家当前控制的文明」：不存在或已灭亡时给 null，前端留空
         WorldStateResponse.Pillars pillars = null;
-        Civilization player = world.findCivilization(PLAYER_CIV_ID);
+        Civilization player = playerCivilization(sessionId);
         if (player != null && player.getPopulation() > 0) {
             pillars = new WorldStateResponse.Pillars(player.getScience(), player.getWelfare(),
                     player.getResource(), player.getMilitary());
@@ -108,55 +122,111 @@ public class WorldController {
                     player.currentEra(), player.getEraIndex(),
                     pointsOf(player), indicatorsOf(player));
         }
-        // 终局判定：以引擎为准，再兜一层（玩家灭亡 / 到 1000 年）保证实时反映
+        // 终局判定：完全交给引擎（引擎按「玩家当前控制的文明」判定，灭亡与 1000 年上限都在 tick 里判完）。
+        // 这里不再兜一层写死 id=1 的逻辑——否则玩家切换到别的文明后会立刻被误判为终局。
         boolean gameOver = engine.isGameOver();
         String gameOverReason = engine.getGameOverReason();
-        if (!gameOver) {
-            if (player == null || player.getPopulation() <= 0) {
-                int founded = player == null ? 0 : player.getFoundedYear();
-                gameOver = true;
-                gameOverReason = "你的国家在 Y" + year + " 年灭亡，存活了 " + Math.max(0, year - founded) + " 年";
-            } else if (year >= EvolutionEngine.GAME_MAX_YEAR) {
-                gameOver = true;
-                gameOverReason = "你的国家活到了第 " + EvolutionEngine.GAME_MAX_YEAR + " 年";
-            }
-        }
         return new WorldStateResponse(state, clockService.currentSpeed(), clockService.isPaused(), pillars,
                 playerView, gameOver, gameOverReason, civilizations);
     }
 
+    /**
+     * 取当前请求玩家所控制的文明。
+     *
+     * <p>带了 sessionId 且能认出玩家：只认它当前控制的文明（还没分配 / 该文明不存在 → null），
+     * 绝不落到别人的文明上（否则多玩家时看起来就是「文明重合」）。
+     * 没带 sessionId 或认不出该玩家：退回文明 id=1，兼容旧调用。
+     */
+    private Civilization playerCivilization(String sessionId) {
+        if (sessionId != null && !sessionId.isBlank()) {
+            Player player = playerService.get(sessionId);
+            if (player != null) {
+                int civId = player.getControlledCivId();
+                if (civId <= 0) {
+                    return null;   // 已登录但还没分到独立文明
+                }
+                return world.findCivilization(civId);
+            }
+        }
+        return world.findCivilization(PLAYER_CIV_ID);
+    }
+
     // ==================== 玩家接口 ====================
 
-    /** 加入游戏：body {"name":"张三"} → 返回 {"sessionId":"xxx","civId":1} */
+    /**
+     * 加入游戏：body {"name":"张三"} →
+     * 返回 {"sessionId":"xxx","civId":1,"civName":"人类","aliveCivCount":1}。
+     *
+     * <p><b>civId &gt; 0</b>：分到了一个独立且有效的文明（没被别人控制、也不是灭亡文明），直接用。
+     * <b>civId = 0</b>：当前没有可分给它的独立文明（比如世界里只有 1 个文明且已被别人控制），
+     * 前端据此提示玩家「和朋友共用一个文明」或「等新文明诞生后再切换」。civName 为 null。
+     */
     @PostMapping("/player/join")
     public JoinResult join(@RequestBody(required = false) JoinRequest request) {
         String name = request == null || request.name() == null ? "匿名" : request.name();
         Player player = playerService.join(name);
-        // 第一个加入的玩家分配文明 id=1，第二个 id=2，以此类推
-        int civId = world.getCivilizations().isEmpty() ? 1
-                : (int) (world.getCivilizations().stream()
-                         .mapToLong(Civilization::getId)
-                         .max().orElse(0) + 1);
-        // 分配文明
+        // 从 1 开始扫：跳过已被别人控制的、已灭亡的文明（见 allocateCivId）
+        int candidate = allocateCivId(player.getSessionId());
+        Civilization assigned = candidate == 0 ? null : world.findCivilization(candidate);
+        boolean valid = assigned != null && assigned.getPopulation() > 0;
+        int civId = valid ? candidate : 0;
         player.setControlledCivId(civId);
-        return new JoinResult(player.getSessionId(), civId);
+        return new JoinResult(player.getSessionId(), civId, valid ? assigned.getName() : null,
+                world.aliveCivilizationCount());
     }
 
-    /** 切换控制的文明：body {"civId":3} */
+    /**
+     * 从 1 开始找第一个可分配的文明 id：
+     * 跳过已被其他在线玩家控制的文明，也跳过已经灭亡的文明；该 id 尚无文明对象时照样返回，
+     * 由 {@link #join} 判定它是不是「有效文明」。
+     */
+    private int allocateCivId(String sessionId) {
+        for (int civId = 1; civId <= MAX_CIV_ID_SCAN; civId++) {
+            if (playerService.isControlledByOther(civId, sessionId)) {
+                continue;   // 已被别的玩家控制
+            }
+            Civilization existing = world.findCivilization(civId);
+            if (existing != null && existing.getPopulation() <= 0) {
+                continue;   // 已灭亡
+            }
+            return civId;
+        }
+        // 兜底：扫描区间外往后顺延，绝不返回已被占用的 id
+        int fallback = MAX_CIV_ID_SCAN + 1;
+        while (playerService.isControlledByOther(fallback, sessionId)) {
+            fallback++;
+        }
+        return fallback;
+    }
+
+    /**
+     * 切换控制的文明。sessionId 走 query 参数（与其它需要身份的接口保持一致）。
+     * body {"civId":3}
+     */
     @PostMapping("/player/choose-civ")
     public ApiResult chooseCiv(@RequestBody(required = false) ChooseCivRequest request,
                                @RequestParam(required = false) String sessionId) {
-        if (sessionId == null) {
-            return new ApiResult(false, "请提供 sessionId");
+        if (sessionId == null || sessionId.isBlank()) {
+            return new ApiResult(false, SESSION_EXPIRED_MESSAGE);
         }
         playerService.touch(sessionId);
         Player player = playerService.get(sessionId);
         if (player == null) {
-            return new ApiResult(false, "sessionId 无效");
+            // 后端重启过 / 会话太久没心跳：内存里已经没有这个 session
+            return new ApiResult(false, SESSION_EXPIRED_MESSAGE);
         }
         if (request == null || request.civId() <= 0) {
             return new ApiResult(false, "请提供 civId");
         }
+        // 只允许切到「真实存在且存活」的文明：不存在的 id 一律拒绝，否则玩家会控制一个幻影文明
+        Civilization target = world.findCivilization(request.civId());
+        if (target == null) {
+            return new ApiResult(false, "文明 " + request.civId() + " 不存在");
+        }
+        if (target.getPopulation() <= 0) {
+            return new ApiResult(false, "文明 " + request.civId() + " 已灭亡，无法切换");
+        }
+        // 只改玩家当前控制的文明，不触发任何终局判定（终局由引擎按「当前控制的文明」重新求值）
         player.setControlledCivId(request.civId());
         return new ApiResult(true, "已切换到文明 " + request.civId());
     }
@@ -178,12 +248,20 @@ public class WorldController {
 
     // ==================== 同步接口 ====================
 
-    /** 快速同步：前端每秒调一次。 */
+    /**
+     * 快速同步：前端每秒调一次。
+     *
+     * <p>{@code sessionValid} 告诉前端「你带的 sessionId 后端还认不认得」——后端重启会清空内存里的
+     * 玩家表，旧 sessionId 就认不出了；前端据此清掉本地会话、重新加入。
+     * 压根没带 sessionId（还没登录）不算失效，免得一进页面就弹重新登录。
+     */
     @GetMapping("/sync")
     public SyncResult sync(@RequestParam(required = false) Long since,
                           @RequestParam(required = false) String sessionId) {
+        boolean loggedIn = sessionId != null && !sessionId.isBlank();
+        boolean sessionValid = !loggedIn || playerService.get(sessionId) != null;
         // 更新玩家心跳
-        if (sessionId != null) {
+        if (loggedIn) {
             playerService.touch(sessionId);
         }
         int eventCount = worldMapper.selectEvents().size();
@@ -194,17 +272,17 @@ public class WorldController {
             regionOwners.put(region.getId(), region.getOwnerCivId());
         }
         return new SyncResult(System.currentTimeMillis(), world.getYear(),
-                engine.isGameOver(), eventCount, playerCount, regionOwners);
+                engine.isGameOver(), eventCount, playerCount, regionOwners, sessionValid);
     }
 
     // ==================== 投票接口 ====================
 
-    /** 发起投票：body {"type":"skip_era","targetEraIndex":7} */
+    /** 发起投票（sessionId 走 query 参数）：body {"type":"skip_era","targetEraIndex":7} */
     @PostMapping("/vote/propose")
     public VoteResult propose(@RequestBody(required = false) ProposeRequest request,
                              @RequestParam(required = false) String sessionId) {
-        if (sessionId == null) {
-            return new VoteResult(false, "请提供 sessionId", null);
+        if (sessionId == null || sessionId.isBlank() || playerService.get(sessionId) == null) {
+            return new VoteResult(false, SESSION_EXPIRED_MESSAGE, null);
         }
         playerService.touch(sessionId);
         if (request == null) {
@@ -230,11 +308,11 @@ public class WorldController {
         }
     }
 
-    /** 同意投票。 */
+    /** 同意投票（sessionId 走 query 参数，与 propose 一致）。 */
     @PostMapping("/vote/agree")
     public VoteResult agree(@RequestParam(required = false) String sessionId) {
-        if (sessionId == null) {
-            return new VoteResult(false, "请提供 sessionId", null);
+        if (sessionId == null || sessionId.isBlank() || playerService.get(sessionId) == null) {
+            return new VoteResult(false, SESSION_EXPIRED_MESSAGE, null);
         }
         playerService.touch(sessionId);
         if (!voteService.hasVote()) {
@@ -268,14 +346,19 @@ public class WorldController {
 
     // ==================== DTO ====================
 
-    public record JoinResult(String sessionId, int civId) {}
+    /**
+     * @param civId         分到的文明 id；0 表示当前没有独立文明可分（让前端提示共用一个或等新文明）
+     * @param civName       分到的文明名；civId 为 0 时是 null
+     * @param aliveCivCount 当前存活文明数（前端用来写「当前只有 N 个文明」）
+     */
+    public record JoinResult(String sessionId, int civId, String civName, int aliveCivCount) {}
     public record JoinRequest(String name) {}
     public record ChooseCivRequest(int civId) {}
     public record ApiResult(boolean ok, String message) {}
     public record PlayerInfo(String sessionId, String name, int civId, String civName) {}
     public record SyncResult(long serverTime, int year, boolean gameOver,
                             int eventCount, int playerCount,
-                            Map<Integer, Integer> regionOwners) {}
+                            Map<Integer, Integer> regionOwners, boolean sessionValid) {}
     public record ProposeRequest(String type, int targetEraIndex) {}
     public record VoteResult(boolean ok, String message, VoteService.VoteStatus status) {}
 
@@ -726,5 +809,30 @@ public class WorldController {
 
     /** 直接研究响应：成功给 result，校验失败给 error，另一个字段为 null。 */
     public record ResearchResult(String result, String error) {
+    }
+
+    /**
+     * 兼容别名控制器：只转发 {@code /api/vote/status}。
+     *
+     * <p>历史前端调的是 {@code /api/vote/status}（少了 {@code /world} 这段前缀），而本类的类级前缀是
+     * {@code /api/world}，没法直接暴露那个路径，于是 404。规范路径是
+     * {@code /api/world/vote/status}（前端已改用它）；这里额外保留一个只读别名，
+     * 让旧页面 / 旧缓存里的 front-end 也能拿到状态，不至于刷一排 404。
+     */
+    @RestController
+    @RequestMapping("/api/vote")
+    public static class VoteCompatController {
+
+        private final VoteService voteService;
+
+        VoteCompatController(VoteService voteService) {
+            this.voteService = voteService;
+        }
+
+        /** 没有进行中的投票时返回 200 + 空 body（与规范路径一致）。 */
+        @GetMapping("/status")
+        public VoteService.VoteStatus status() {
+            return voteService.status();
+        }
     }
 }

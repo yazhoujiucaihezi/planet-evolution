@@ -19,7 +19,13 @@ const RARITY_LABELS = {
 
 // 玩家会话状态
 let sessionId = localStorage.getItem('planet_session_id');
-let controlledCivId = null;
+/**
+ * 当前玩家控制的文明 id —— 地图上「红色 = 自己的文明」全看它。
+ * 来源是 /api/world 返回的 player 字段（后端按 sessionId 解析出的「我控制哪个文明」），
+ * 加入 / 切换文明后由 refresh() 重新同步；没登录或还没分到文明时是 null（则没有文明显示红色）。
+ * 不再写死 1。
+ */
+let playerCivId = null;
 let playerName = localStorage.getItem('planet_player_name') || '';
 // 最近一次拿到的世界年份（混乱度提示 toast 用）
 let lastWorldYear = 0;
@@ -108,7 +114,7 @@ function renderWorld(state) {
     if (playerInfo) {
       playerInfo.hidden = false;
       $('playerName').textContent = playerName;
-      $('playerCiv').textContent = controlledCivId ? '文明-' + controlledCivId : '旁观';
+      $('playerCiv').textContent = playerCivId ? '文明-' + playerCivId : '旁观';
     }
   }
 
@@ -826,8 +832,7 @@ const REGION_NEIGHBORS = {
   30: [25, 26, 27, 28],
 };
 
-// 玩家文明固定 id
-const PLAYER_CIV_ID = 1;
+// 自己的文明高亮色（到底是哪个文明由 playerCivId 决定，见文件顶部）
 const PLAYER_COLOR = '#ff2d2d';
 
 // 颜色收敛方案
@@ -845,9 +850,10 @@ const TERRAIN_LABELS = {
   jungle: '热带',
 };
 
-// 文明配色：玩家红色，其他文明蓝色系
+// 文明配色：自己的文明红色，其他文明蓝色系
 function colorForCiv(civId) {
-  if (civId === PLAYER_CIV_ID) {
+  // 只有「自己当前控制的文明」是红的；别人（含多人在线时的其他玩家）一律蓝色系
+  if (playerCivId != null && civId === playerCivId) {
     return PLAYER_COLOR;
   }
   // 蓝色系：hsl(210, 55%, 38% + (civId % 6) * 5%)
@@ -989,7 +995,7 @@ function styleRegionBorder(el, region, byId) {
   if (!region || region.explored === false) return;
   el.style.vectorEffect = 'non-scaling-stroke';
   const ownerId = region.ownerCivId || 0;
-  if (ownerId === PLAYER_CIV_ID) {
+  if (playerCivId != null && ownerId === playerCivId) {
     el.style.stroke = '#ff4444';
     el.style.strokeWidth = '2';
   } else if (hasForeignNeighbor(region, byId)) {
@@ -1262,9 +1268,14 @@ function renderDiplomacy(diplomacy) {
 
 // ==================== 主刷新逻辑 ====================
 
+/** /api/world 的地址：带上 sessionId，后端据此返回「当前控制的文明」的四柱 / 概览。 */
+function worldUrl() {
+  return sessionId ? `/api/world?sessionId=${encodeURIComponent(sessionId)}` : '/api/world';
+}
+
 async function refresh() {
   const [state, events, regions, diplomacy, chaos] = await Promise.all([
-    api('/api/world', { cache: 'no-store' }),
+    api(worldUrl(), { cache: 'no-store' }),
     api('/api/world/events', { cache: 'no-store' }),
     api('/api/world/regions', { cache: 'no-store' }),
     // 待回应的 AI 外交：后端没有时返回 { pending: false }，读失败当没有处理
@@ -1272,6 +1283,9 @@ async function refresh() {
     // 世界混乱度（左栏进度条）
     api('/api/chaos', { cache: 'no-store' }).catch(() => null),
   ]);
+
+  // 「我控制的文明」以后端 /api/world 为准：切换文明后会跟着变，地图红色标记靠它（不是写死的 1）
+  playerCivId = state && state.player && state.player.id > 0 ? state.player.id : null;
 
   renderDiplomacy(diplomacy);
   renderChaos(chaos);
@@ -1480,11 +1494,13 @@ function bind() {
       $('commandResult').textContent = '请先输入一条指令。';
       return;
     }
+    // 后端按 sessionId 定位「你当前控制的文明」，没有就先登录拿一个
+    if (!sessionId) await ensureLoggedIn();
     const button = $('sendCommand');
     button.disabled = true;
     $('commandResult').textContent = '正在解析指令……';
     try {
-      const result = await post('/api/command', { text });
+      const result = await post('/api/command', { text, sessionId });
       if (result && result.result) {
         $('commandResult').textContent = result.result;
         // 捕获战斗事件，等 refresh 重绘完地图后再播放动画
@@ -1495,7 +1511,7 @@ function bind() {
         if (result.chaosChange) {
           showChaosToast(result.chaosChange);
         }
-      } else {
+      } else if (!handleIfSessionExpired(result)) {
         $('commandResult').textContent = '指令失败：' + ((result && result.error) || '未知错误');
       }
     } finally {
@@ -1962,7 +1978,7 @@ function detectEraUpgrade(state) {
 // ========== 初始化时加载之前的状态 ==========
 async function initAnimationState() {
   try {
-    const state = await api('/api/world', { cache: 'no-store' });
+    const state = await api(worldUrl(), { cache: 'no-store' });
     const events = await api('/api/world/events', { cache: 'no-store' });
     const regions = await api('/api/world/regions', { cache: 'no-store' });
 
@@ -1987,6 +2003,40 @@ initAnimationState();
 let _syncState = null;
 let _syncInterval = null;
 
+/** 后端统一用这句话表示「认不出你的 sessionId」（WorldController.SESSION_EXPIRED_MESSAGE）。 */
+const SESSION_EXPIRED_MARKER = '登录已失效';
+/** 防止每秒一次的同步把「重新登录」弹爆。 */
+let _reloginInFlight = false;
+
+/** 响应里带「登录已失效」就清会话、重新加入；返回 true 表示已接管这次错误提示。 */
+function handleIfSessionExpired(result) {
+  const msg = (result && (result.error || result.message)) || '';
+  if (typeof msg === 'string' && msg.includes(SESSION_EXPIRED_MARKER)) {
+    handleSessionExpired();
+    return true;
+  }
+  return false;
+}
+
+/**
+ * sessionId 失效：后端重启会清空内存里的玩家表，localStorage 里的旧 id 就认不出了。
+ * 处理方式：清掉本地会话 → 重新弹输入名字 → 加入游戏（重新拿一个 sessionId 存回 localStorage）。
+ */
+async function handleSessionExpired() {
+  if (_reloginInFlight) return;
+  _reloginInFlight = true;
+  localStorage.removeItem('planet_session_id');
+  sessionId = null;
+  playerCivId = null;
+  _syncState = null;
+  showError('登录已失效，请重新输入名字加入');
+  try {
+    await ensureLoggedIn();   // 里面会 prompt 名字并重新 join，成功后写回 localStorage
+  } finally {
+    _reloginInFlight = false;
+  }
+}
+
 async function ensureLoggedIn() {
   if (sessionId) return;
 
@@ -2003,9 +2053,16 @@ async function ensureLoggedIn() {
     });
     if (result && result.sessionId) {
       sessionId = result.sessionId;
-      controlledCivId = result.civId;
+      // 存 localStorage：刷新页面后前端还认得自己（后端按它还原「我控制的文明」）
       localStorage.setItem('planet_session_id', sessionId);
-      showNotice(`欢迎 ${name}！你控制文明 ${controlledCivId}`, 4000);
+      playerCivId = result.civId;
+      if (playerCivId > 0) {
+        // 分到了独立且有效的文明，直接用
+        showNotice(`欢迎 ${name}！你控制${result.civName || ('文明 ' + playerCivId)}`, 4000);
+      } else {
+        // 没分到独立文明（比如世界里只有 1 个文明，已被别人控制）：不硬塞给别人，让玩家自己选
+        showNoCivNotice(result.aliveCivCount);
+      }
     }
   } catch (e) {
     showError('加入游戏失败：' + e.message);
@@ -2019,6 +2076,12 @@ async function syncWorld() {
     const result = await api(`/api/world/sync?sessionId=${encodeURIComponent(sessionId)}`);
     if (!result) return;
 
+    // 后端认不出这个 sessionId（多半是后端重启过）→ 清掉本地会话、重新加入，别继续拿着废 id 操作
+    if (result.sessionValid === false) {
+      handleSessionExpired();
+      return;
+    }
+
     // 检测变化
     const needsFullRefresh =
       !_syncState ||
@@ -2031,7 +2094,7 @@ async function syncWorld() {
     }
 
     // 检测投票
-    const voteStatus = await api('/api/vote/status');
+    const voteStatus = await api('/api/world/vote/status');
     if (voteStatus) {
       showVoteBar(voteStatus);
     } else {
@@ -2064,12 +2127,16 @@ function showVoteBar(status) {
   `;
   bar.style.display = 'flex';
   $('voteAgree')?.addEventListener('click', async () => {
-    await api('/api/world/vote/agree', {
+    // sessionId 统一走 query 参数（后端从 @RequestParam 读；放 body 里后端根本读不到）
+    const result = await api(`/api/world/vote/agree?sessionId=${encodeURIComponent(sessionId || '')}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId })
+      headers: { 'Content-Type': 'application/json' }
     });
-    showNotice('已同意投票', 2000);
+    if (result && result.ok) {
+      showNotice('已同意投票', 2000);
+    } else if (!handleIfSessionExpired(result)) {
+      showError((result && result.message) || '同意投票失败');
+    }
     syncWorld();
   });
 }
@@ -2087,6 +2154,7 @@ function startSync() {
 async function initPlayer() {
   await ensureLoggedIn();
   await initAnimationState();
+  // syncWorld 内部的 refresh() 会用 /api/world 的 player 同步 playerCivId，刷新后也认得出自己
   await syncWorld();
   startSync();
 }
@@ -2134,28 +2202,99 @@ function addSwitchCivButton() {
   btn.style.marginTop = '8px';
   btn.addEventListener('click', async () => {
     if (!sessionId) await ensureLoggedIn();
-    const players = await api('/api/world/player/list');
-    if (!players || players.length === 0) {
-      showError('当前无在线玩家');
+    // 列「所有存活文明」并标出归属。原来只列在线玩家，问题有二：
+    //   1) 没分到独立文明的玩家 civId=0，选中后提交 civId=0 → 后端报「请提供 civId」→ 切换失败；
+    //   2) 无主 / 新诞生的文明根本选不到，「等新文明诞生后切换」形同虚设。
+    const [state, players] = await Promise.all([
+      api(worldUrl(), { cache: 'no-store' }),
+      api('/api/world/player/list').catch(() => null),
+    ]);
+    const civs = ((state && state.civilizations) || []).filter((c) => c && c.population > 0);
+    if (civs.length === 0) {
+      showError('当前没有存活的文明');
       return;
     }
-    const choices = players.map((p, i) => `${i + 1}. ${p.name} (${p.civName || '文明' + p.civId})`).join('\n');
-    const choice = prompt(`当前在线玩家：\n${choices}\n\n输入序号切换：`);
+    const ownerOf = new Map();
+    (players || []).forEach((p) => {
+      if (p && p.civId > 0 && !ownerOf.has(p.civId)) ownerOf.set(p.civId, p.name);
+    });
+    const choices = civs
+      .map((c, i) => `${i + 1}. ${c.name}（${ownerOf.get(c.id) ? ownerOf.get(c.id) + ' 控制' : '无主'}）`)
+      .join('\n');
+    const choice = prompt(`可选文明：\n${choices}\n\n输入序号切换：`);
     if (!choice) return;
     const idx = parseInt(choice.trim()) - 1;
-    if (isNaN(idx) || idx < 0 || idx >= players.length) return;
-    const p = players[idx];
-    const result = await api(`/api/world/player/choose-civ?sessionId=${encodeURIComponent(sessionId)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ civId: p.civId })
-    });
-    if (result && result.ok) {
-      controlledCivId = p.civId;
-      showNotice(`已切换到 ${p.civName || '文明' + p.civId}`, 2000);
-    }
+    if (isNaN(idx) || idx < 0 || idx >= civs.length) return;
+    const civ = civs[idx];
+    await switchToCiv(civ.id, civ.name);
   });
   sideBlock.appendChild(btn);
+}
+
+/** 切换到自己控制的文明；成功返回 true。供「切换文明」按钮与加入提示共用。 */
+async function switchToCiv(civId, label) {
+  if (!sessionId) await ensureLoggedIn();
+  const result = await api(`/api/world/player/choose-civ?sessionId=${encodeURIComponent(sessionId)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ civId })
+  });
+  if (result && result.ok) {
+    playerCivId = civId;
+    showNotice(`已切换到 ${label || ('文明 ' + civId)}`, 2000);
+    // 切换后立刻刷新：终局遮罩 / 玩家面板都要按「新控制的文明」重新渲染
+    await refresh();
+    return true;
+  }
+  if (!handleIfSessionExpired(result)) {
+    showError((result && result.message) || '切换文明失败');
+  }
+  return false;
+}
+
+/** 当前世界里第一个存活文明（用于「和朋友共用一个文明」）。 */
+async function firstAliveCiv() {
+  const state = await api(worldUrl(), { cache: 'no-store' });
+  const civs = (state && state.civilizations) || [];
+  return civs.find((c) => c && c.population > 0) || null;
+}
+
+/**
+ * 没分到独立文明时的提示：不硬塞给别人，给玩家两个选项
+ *   a) 和朋友共用一个文明（切到当前第一个存活文明）
+ *   b) 等新文明诞生后，自己点「切换文明」
+ */
+function showNoCivNotice(aliveCivCount) {
+  const n = typeof aliveCivCount === 'number' ? aliveCivCount : '?';
+  const old = $('joinChoice');
+  if (old) old.remove();
+
+  const box = document.createElement('div');
+  box.id = 'joinChoice';
+  box.className = 'vote-bar';                 // 复用投票条的样式，不新增 CSS
+  box.style.flexDirection = 'column';
+  box.style.alignItems = 'flex-start';
+  box.innerHTML = `
+    <div class="vote-info">
+      <strong>当前只有 ${n} 个文明</strong>，暂时没有可分给你的独立文明。你可以：
+      <br>a) 和朋友共用一个文明
+      <br>b) 等新文明诞生后，点「切换文明」再选
+    </div>
+    <div style="display:flex;gap:8px;margin-top:8px;">
+      <button id="joinShareCiv">a) 共用一个文明</button>
+      <button id="joinWaitCiv">b) 等新文明诞生</button>
+    </div>`;
+  document.body.appendChild(box);
+
+  $('joinShareCiv')?.addEventListener('click', async () => {
+    const civ = await firstAliveCiv();
+    if (!civ) {
+      showError('当前没有可加入的文明');
+      return;
+    }
+    if (await switchToCiv(civ.id, civ.name)) box.remove();
+  });
+  $('joinWaitCiv')?.addEventListener('click', () => box.remove());
 }
 
 // 页面加载完成后初始化

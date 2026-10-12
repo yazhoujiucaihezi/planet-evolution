@@ -19,7 +19,9 @@ import com.planet.evolution.ai.AiNarrator;
 import com.planet.evolution.mapper.WorldMapper;
 import com.planet.evolution.model.Civilization;
 import com.planet.evolution.model.Memory;
+import com.planet.evolution.model.Player;
 import com.planet.evolution.model.Region;
+import com.planet.evolution.service.PlayerService;
 import com.planet.evolution.simulation.EventType;
 import com.planet.evolution.simulation.EvolutionEngine;
 import com.planet.evolution.simulation.GameEvent;
@@ -35,7 +37,7 @@ import com.planet.evolution.model.World;
 @RequestMapping("/api")
 public class ChatController {
 
-    /** 玩家文明固定为 id = 1（第一个文明）。 */
+    /** 没有 sessionId / 找不到玩家时，退回的默认玩家文明 id（兼容旧调用）。 */
     private static final long PLAYER_CIV_ID = 1L;
     /** develop_tech 每次增加的科技。 */
     private static final int DEVELOP_TECH_GAIN = 50;
@@ -140,63 +142,140 @@ public class ChatController {
     private final AiNarrator aiNarrator;
     private final WorldMapper worldMapper;
     private final ObjectMapper objectMapper;
+    /** 在线玩家服务：按 sessionId 找到「这次指令是谁发的」，再定位其当前控制的文明。 */
+    private final PlayerService playerService;
     private final ReentrantLock commandLock = new ReentrantLock();
 
     public ChatController(World world, EvolutionEngine engine, AiNarrator aiNarrator,
-            WorldMapper worldMapper, ObjectMapper objectMapper) {
+            WorldMapper worldMapper, ObjectMapper objectMapper, PlayerService playerService) {
         this.world = world;
         this.engine = engine;
         this.aiNarrator = aiNarrator;
         this.worldMapper = worldMapper;
         this.objectMapper = objectMapper;
+        this.playerService = playerService;
+    }
+
+    /** 抢指令锁的最长等待：AI 调用已挪到锁外，单次持锁只做内存操作，正常远低于此值。 */
+    private static final long COMMAND_LOCK_TIMEOUT_MILLIS = 500L;
+    /** 抢指令锁的重试间隔。 */
+    private static final long COMMAND_LOCK_RETRY_MILLIS = 50L;
+    /** 抢不到锁时的提示。 */
+    private static final String BUSY_MESSAGE = "世界正忙，请重试";
+    /** 等待过程中被中断的提示。 */
+    private static final String INTERRUPTED_MESSAGE = "操作被中断，请重试";
+    /** 认不出「本次指令的玩家文明」时的提示。 */
+    private static final String NO_CIV_MESSAGE = "找不到你控制的文明（可能还没分配、尚未诞生或已灭亡）";
+
+    /**
+     * 抢指令锁：每 {@link #COMMAND_LOCK_RETRY_MILLIS} ms 重试一次，最多等
+     * {@link #COMMAND_LOCK_TIMEOUT_MILLIS} ms；仍拿不到返回 false（调用方回「世界正忙」）。
+     */
+    private boolean acquireCommandLock() throws InterruptedException {
+        long deadline = System.currentTimeMillis() + COMMAND_LOCK_TIMEOUT_MILLIS;
+        do {
+            if (commandLock.tryLock(COMMAND_LOCK_RETRY_MILLIS, TimeUnit.MILLISECONDS)) {
+                return true;
+            }
+        } while (System.currentTimeMillis() < deadline);
+        return false;
+    }
+
+    /** 抢不到锁时的统一返回。 */
+    private static CommandResult busyResult() {
+        return new CommandResult(null, BUSY_MESSAGE);
     }
 
     /** 玩家下达指令。 */
     @PostMapping("/command")
     public CommandResult command(@RequestBody(required = false) CommandRequest request) {
         String text = request == null ? null : request.text();
+        // 本次指令是谁发的：据此定位该玩家当前控制的文明（多玩家时不能再写死 id=1）
+        String sessionId = request == null ? null : request.sessionId();
         if (text == null || text.isBlank()) {
             return new CommandResult(null, "指令为空");
         }
+        return executeCommand(text, sessionId);
+    }
 
-        // 加锁：拿不到锁说明有其他玩家正在操作
+    /**
+     * 执行一条指令。为了让「外交」这类轻量操作不被别人的 AI 调用堵住，锁被拆成三段：
+     * <ol>
+     *   <li><b>持锁</b>：认出玩家 + 拼 prompt（只读世界）；</li>
+     *   <li><b>放锁</b>：调 AI（1~3 秒网络调用）+ 解析回复（纯计算，不碰世界）；</li>
+     *   <li><b>再持锁</b>：把改动落到世界（见 {@link #applyCommand}）。</li>
+     * </ol>
+     */
+    private CommandResult executeCommand(String text, String sessionId) {
+        // ---------- 第 1 段：持锁，认出玩家并拼 prompt ----------
+        String prompt;
         try {
-            if (!commandLock.tryLock(2, TimeUnit.SECONDS)) {
-                return new CommandResult(null, "世界正在被其他玩家操作，请稍后重试");
+            if (!acquireCommandLock()) {
+                return busyResult();
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return new CommandResult(null, "操作被中断，请重试");
+            return new CommandResult(null, INTERRUPTED_MESSAGE);
+        }
+        try {
+            Civilization player = playerCivilization(sessionId);
+            if (player == null) {
+                return new CommandResult(null, NO_CIV_MESSAGE);
+            }
+            if (aiNarrator == null) {
+                return new CommandResult(null, "AI 未启用，无法翻译指令");
+            }
+            prompt = buildPrompt(text, player);
+        } finally {
+            commandLock.unlock();
         }
 
+        // ---------- 第 2 段：不持锁，调 AI 并解析 ----------
+        String reply = aiNarrator.narrate(prompt);
+        if (reply == null) {
+            return new CommandResult(null, "AI 未返回结果（可能未配置 API Key 或调用失败）");
+        }
+
+        ParsedCommand cmd;
         try {
-            return executeCommand(text);
+            cmd = parseCommand(reply);
+        } catch (Exception e) {
+            // 本地小模型（如 qwen2.5:3b）经常不按 JSON 输出：把 AI 原文透给前端，才看得出它到底说了什么
+            return new CommandResult(null, "指令失败：AI 说了：" + previewAiReply(reply));
+        }
+
+        // ---------- 第 3 段：再持锁，落地改动 ----------
+        try {
+            if (!acquireCommandLock()) {
+                return busyResult();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new CommandResult(null, INTERRUPTED_MESSAGE);
+        }
+        try {
+            return applyCommand(text, sessionId, cmd);
         } finally {
             commandLock.unlock();
         }
     }
 
-    private CommandResult executeCommand(String text) {
-        Civilization player = playerCivilization();
-        if (player == null) {
-            return new CommandResult(null, "找不到玩家文明（id=1）或它已灭亡");
+    /** 把 AI 回复解析成结构化指令；纯计算、不碰世界，调用时不需要持锁。 */
+    private ParsedCommand parseCommand(String reply) throws Exception {
+        JsonNode node = parseJson(reply);
+        String action = node.path("action").asText("free").trim().toLowerCase();
+        // free 是默认动作：AI 给了未知 / 空动作时一律当 free，绝不落到「无法理解」
+        if (!KNOWN_ACTIONS.contains(action)) {
+            action = "free";
         }
-        if (aiNarrator == null) {
-            return new CommandResult(null, "AI 未启用，无法翻译指令");
-        }
-
-        String reply = aiNarrator.narrate(buildPrompt(text, player));
-        if (reply == null) {
-            return new CommandResult(null, "AI 未返回结果（可能未配置 API Key 或调用失败）");
-        }
-
-        String action;
-        String scope;
-        String target;
-        String replyText;
-        /** 仅 action=diplomacy 时用到：玩家对外交的态度 agree / reject / war。 */
-        String stance;
-        int[] pillarDelta;
+        String scope = parseScope(node.path("scope"));
+        String target = node.path("target").asText("").trim();
+        // 只有 action=ask 会用到 reply；其他 action 即使带了 reply 也一律忽略（applyCommand 不读它）
+        String replyText = node.path("reply").asText("").trim();
+        // 只有 action=diplomacy 会用到 stance；缺失或认不出时按原话关键词兜底（见 normalizeStance）
+        String stance = node.path("stance").asText("").trim().toLowerCase();
+        // 四柱变化由 AI 顺手判断，缺失或非法一律当 0，绝不让它影响指令本身的执行
+        int[] pillarDelta = parsePillarDeltas(node.path("pillars"));
         // free（自由行动）相关字段
         boolean freeFailed = false;
         String freeReason = "";
@@ -204,33 +283,32 @@ public class ChatController {
         String freeEvent = "";
         long[] freeEffects = new long[4];
         List<String> freeNewRegions = new ArrayList<>();
-        try {
-            JsonNode node = parseJson(reply);
-            action = node.path("action").asText("free").trim().toLowerCase();
-            // free 是默认动作：AI 给了未知 / 空动作时一律当 free，绝不落到「无法理解」
-            if (!KNOWN_ACTIONS.contains(action)) {
-                action = "free";
-            }
-            scope = parseScope(node.path("scope"));
-            target = node.path("target").asText("").trim();
-            // 只有 action=ask 会用到 reply；其他 action 即使带了 reply 也一律忽略（下面的 switch 不读它）
-            replyText = node.path("reply").asText("").trim();
-            // 只有 action=diplomacy 会用到 stance；缺失或认不出时按原话关键词兜底（见 normalizeStance）
-            stance = node.path("stance").asText("").trim().toLowerCase();
-            // 四柱变化由 AI 顺手判断，缺失或非法一律当 0，绝不让它影响指令本身的执行
-            pillarDelta = parsePillarDeltas(node.path("pillars"));
-            if ("free".equals(action)) {
-                freeFailed = node.path("failed").asBoolean(false);
-                freeReason = node.path("reason").asText("").trim();
-                freeNarrative = node.path("narrative").asText("").trim();
-                freeEvent = node.path("event").asText("").trim();
-                freeEffects = parseFreeEffects(node.path("effects"));
-                freeNewRegions = parseNewRegions(node.path("newRegions"));
-            }
-        } catch (Exception e) {
-            return new CommandResult(null, "AI 返回的内容无法解析为指令：" + e.getMessage());
+        if ("free".equals(action)) {
+            freeFailed = node.path("failed").asBoolean(false);
+            freeReason = node.path("reason").asText("").trim();
+            freeNarrative = node.path("narrative").asText("").trim();
+            freeEvent = node.path("event").asText("").trim();
+            freeEffects = parseFreeEffects(node.path("effects"));
+            freeNewRegions = parseNewRegions(node.path("newRegions"));
+        }
+        return new ParsedCommand(action, scope, target, replyText, stance, pillarDelta,
+                freeFailed, freeReason, freeNarrative, freeEvent, freeEffects, freeNewRegions);
+    }
+
+    /**
+     * 持锁执行：把一条已解析的指令落到世界（关系值、人口、科技、事件、四柱、因果种子…）。
+     * 只覆盖内存操作，正常 &lt; 10ms；由 {@link #executeCommand} 保证调用时持有指令锁。
+     */
+    private CommandResult applyCommand(String text, String sessionId, ParsedCommand cmd) {
+        // AI 调用期间世界可能推进过：重新认一次玩家，避免把改动落到已经灭亡 / 已被切走的文明上
+        Civilization player = playerCivilization(sessionId);
+        if (player == null) {
+            return new CommandResult(null, NO_CIV_MESSAGE);
         }
 
+        String action = cmd.action();
+        String scope = cmd.scope();
+        String target = cmd.target();
         List<Long> targetCivIds = expandScope(scope, target, player);
         // 只看清单的指令（list_research，以及没带科技名的 research）不算治国动作，不参与四柱变化
         boolean viewOnly = "list_research".equals(action) || ("research".equals(action) && target.isBlank());
@@ -244,9 +322,9 @@ public class ChatController {
 
         String result;
         switch (action) {
-            case "ask" -> result = replyText.isEmpty()
+            case "ask" -> result = cmd.replyText().isEmpty()
                     ? "我还没想好怎么回答，换个问法再问我一次。"
-                    : replyText;
+                    : cmd.replyText();
             case "attack" -> {
                 if (targetCivIds == null || targetCivIds.isEmpty()) {
                     result = attackNoTargetMessage(player, target, combatEvents);
@@ -266,7 +344,7 @@ public class ChatController {
             case "research" -> result = target.isBlank() ? doListResearch(player) : doResearch(player, target);
             case "list_research" -> result = doListResearch(player);
             // 外交回应：目标不由 AI 决定，取引擎里挂起的「最近一条外交」，stance 只区分同意/拒绝/开战
-            case "diplomacy" -> result = doDiplomacy(player, stance, text, combatEvents);
+            case "diplomacy" -> result = doDiplomacy(player, cmd.stance(), text, combatEvents);
             case "expand" -> {
                 if ("ONE".equals(scope) && !target.isEmpty()) {
                     result = doExpandTo(player, target);
@@ -282,13 +360,13 @@ public class ChatController {
                 String gateFail = capabilityGateFailure(player, text);
                 if (gateFail != null) {
                     result = gateFail;
-                } else if (gate != null && freeFailed) {
+                } else if (gate != null && cmd.freeFailed()) {
                     // 门槛其实过了，AI 却判成失败：以后端为准，放行
-                    result = doFree(player, false, freeReason, freeNarrative, freeEvent,
-                            freeEffects, freeNewRegions);
+                    result = doFree(player, false, cmd.freeReason(), cmd.freeNarrative(), cmd.freeEvent(),
+                            cmd.freeEffects(), cmd.freeNewRegions());
                 } else {
-                    result = doFree(player, freeFailed, freeReason, freeNarrative, freeEvent,
-                            freeEffects, freeNewRegions);
+                    result = doFree(player, cmd.freeFailed(), cmd.freeReason(), cmd.freeNarrative(),
+                            cmd.freeEvent(), cmd.freeEffects(), cmd.freeNewRegions());
                 }
             }
             default -> result = "我试着照做，但没能理解出可行的结果，换种说法再试试。";
@@ -297,7 +375,7 @@ public class ChatController {
         // 指令执行完，再把四柱变化落到玩家身上。
         // ask 只是问问题、看清单（viewOnly）也只是查看，都不动国政，所以不吃四柱变化；玩家已经灭亡也就不必再算了。
         if (!"ask".equals(action) && !viewOnly && player.getPopulation() > 0) {
-            String crash = applyPillarsAndCheckCrash(player, pillarDelta);
+            String crash = applyPillarsAndCheckCrash(player, cmd.pillarDelta());
             if (crash != null) {
                 result = result + "\n" + crash;
             }
@@ -306,7 +384,7 @@ public class ChatController {
         // 关键事件后：让 AI 判断这次指令是否留下长期后果（因果种子）。
         // 问问题 / 看清单不算治国动作，不种种子。
         if (engine != null && !"ask".equals(action) && !viewOnly) {
-            engine.considerSeed((int) PLAYER_CIV_ID, "玩家指令「" + text + "」，结果是：" + result);
+            engine.considerSeed((int) player.getId(), "玩家指令「" + text + "」，结果是：" + result);
         }
         return new CommandResult(result, null, combatEvents,
                 engine == null ? null : engine.consumeChaosChange());
@@ -1252,10 +1330,29 @@ public class ChatController {
         return false;
     }
 
-    /** 玩家文明。 */
-    private Civilization playerCivilization() {
-        Civilization player = findCivilization(PLAYER_CIV_ID);
-        return player != null && player.getPopulation() > 0 ? player : null;
+    /**
+     * 解析「本次指令的玩家文明」。
+     *
+     * <p>带 sessionId：按它找到玩家，取其当前控制的文明（玩家不存在 / 该文明尚未诞生 / 已灭亡时返回 null）。
+     * 没带 sessionId 或找不到该玩家：退回文明 id=1，兼容旧调用。
+     */
+    private Civilization playerCivilization(String sessionId) {
+        if (sessionId != null && !sessionId.isBlank() && playerService != null) {
+            Player player = playerService.get(sessionId);
+            if (player != null) {
+                int civId = player.getControlledCivId();
+                if (civId > 0) {
+                    return aliveOrNull(findCivilization(civId));
+                }
+                return null;   // 玩家已登录，但还没分配到文明
+            }
+        }
+        return aliveOrNull(findCivilization(PLAYER_CIV_ID));
+    }
+
+    /** 文明存在且人口 &gt; 0 才算「活着的玩家文明」。 */
+    private static Civilization aliveOrNull(Civilization civilization) {
+        return civilization != null && civilization.getPopulation() > 0 ? civilization : null;
     }
 
     private Civilization findCivilization(long id) {
@@ -1281,6 +1378,23 @@ public class ChatController {
             }
         }
         return null;
+    }
+
+    /** 「解析失败」提示里回显 AI 原文的长度上限。 */
+    private static final int AI_REPLY_PREVIEW_CHARS = 200;
+
+    /**
+     * 截取 AI 原始回复的前 {@link #AI_REPLY_PREVIEW_CHARS} 个字，供「解析失败」时回显。
+     * 顺手把换行/连续空白压成单个空格，免得撑破前端那一行提示。
+     */
+    private static String previewAiReply(String reply) {
+        if (reply == null) {
+            return "(空)";
+        }
+        String flat = reply.replaceAll("\\s+", " ").trim();
+        return flat.length() <= AI_REPLY_PREVIEW_CHARS
+                ? flat
+                : flat.substring(0, AI_REPLY_PREVIEW_CHARS) + "…";
     }
 
     /** 容忍模型带 markdown 代码块或前后废话：截取第一个 { 到最后一个 }。 */
@@ -1652,7 +1766,7 @@ public class ChatController {
                 // 按 target 找文明：先按文明名，找不到再按区域名反查归属文明
                 // （玩家习惯说「进攻南亚」「打欧洲」，而不是先查那里归谁）
                 if (target != null && !target.trim().isEmpty()) {
-                    Long found = findCivilizationByName(target.trim());
+                    Long found = findCivilizationByName(target.trim(), playerId);
                     if (found != null) return List.of(found);
 
                     Region region = findRegionByName(target.trim());
@@ -1674,12 +1788,12 @@ public class ChatController {
         }
     }
 
-    /** 精确匹配优先，再包含匹配，跳过玩家和已灭亡文明。 */
-    private Long findCivilizationByName(String name) {
+    /** 精确匹配优先，再包含匹配，跳过「当前玩家自己」和已灭亡文明。 */
+    private Long findCivilizationByName(String name, long playerCivId) {
         String wanted = name.trim();
         // 先精确匹配
         for (Civilization civ : world.getCivilizations()) {
-            if (civ.getId() == PLAYER_CIV_ID) continue;
+            if (civ.getId() == playerCivId) continue;
             if (civ.getPopulation() <= 0) continue;
             if (civ.getName().equals(wanted)) {
                 return civ.getId();
@@ -1687,7 +1801,7 @@ public class ChatController {
         }
         // 再包含匹配
         for (Civilization civ : world.getCivilizations()) {
-            if (civ.getId() == PLAYER_CIV_ID) continue;
+            if (civ.getId() == playerCivId) continue;
             if (civ.getPopulation() <= 0) continue;
             if (civ.getName().contains(wanted) || wanted.contains(civ.getName())) {
                 return civ.getId();
@@ -1700,8 +1814,17 @@ public class ChatController {
         worldMapper.insertEvent(new GameEvent(year, type, description, rarity));
     }
 
-    /** 请求体。 */
-    public record CommandRequest(String text) {
+    /** 请求体。sessionId 可选：带上就能按「该玩家当前控制的文明」执行指令，不带则退回文明 id=1。 */
+    public record CommandRequest(String text, String sessionId) {
+    }
+
+    /**
+     * 一条已解析的指令（AI 回复的落地形态）。解析在锁外完成、落地在锁内完成，
+     * 两者靠这个不可变载体传递，避免解析期间一直占着锁。
+     */
+    private record ParsedCommand(String action, String scope, String target, String replyText, String stance,
+            int[] pillarDelta, boolean freeFailed, String freeReason, String freeNarrative,
+            String freeEvent, long[] freeEffects, List<String> freeNewRegions) {
     }
 
     /**

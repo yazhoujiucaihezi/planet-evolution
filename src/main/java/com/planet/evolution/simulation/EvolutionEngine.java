@@ -25,6 +25,7 @@ import com.planet.evolution.model.Memory;
 import com.planet.evolution.model.Region;
 import com.planet.evolution.model.Seed;
 import com.planet.evolution.model.World;
+import com.planet.evolution.service.PlayerService;
 
 /**
  * 世界演化引擎：本地计算，不依赖 AI。
@@ -106,6 +107,11 @@ public class EvolutionEngine {
     private boolean gameOver = false;
     /** 终局原因，未结束时为 null。 */
     private String gameOverReason = null;
+    /**
+     * 本次终局是否由「玩家控制的文明全灭」造成。
+     * 只用于区分 1000 年上限的终局：前者可在玩家切换到存活文明后恢复（见 {@link #checkPlayerExtinction(int)}）。
+     */
+    private boolean gameOverByExtinction = false;
 
     /**
      * 科技树的研究模式，默认 passive（玩家文明自动研究）。
@@ -147,6 +153,12 @@ public class EvolutionEngine {
     // 解析 AI 返回的演化 JSON（离线测试没有注入时为 null，直接跳过 AI 演化）
     @Autowired
     private ObjectMapper objectMapper;
+    /**
+     * 在线玩家服务：终局判定需要知道「当前被玩家控制的文明」有哪些（多玩家时不能再看死 id=1）。
+     * 直接 new 出来的引擎（离线测试）没有注入，此时为 null，退回旧的 id=1 口径。
+     */
+    @Autowired(required = false)
+    private PlayerService playerService;
 
     /**
      * AI 回复的落脚点：AI 线程只做网络调用并把原文入队，
@@ -199,6 +211,30 @@ public class EvolutionEngine {
     /** 加锁用的锁。 */
     private final ReentrantLock tickLock = new ReentrantLock();
 
+    /** 抢 tick 锁的最长等待：这个时间内拿不到就跳过这次推进（用户操作则回「世界正忙」）。 */
+    private static final long LOCK_WAIT_MILLIS = 500L;
+    /** 抢 tick 锁的重试间隔。 */
+    private static final long LOCK_RETRY_MILLIS = 50L;
+    /** 抢不到锁时的提示。 */
+    private static final String BUSY_MESSAGE = "世界正忙，请重试";
+
+    /**
+     * 抢 tick 锁：每 {@link #LOCK_RETRY_MILLIS} ms 重试一次，最多等 {@link #LOCK_WAIT_MILLIS} ms；
+     * 仍拿不到返回 false。
+     *
+     * <p>原来直接用 {@code tryLock(2, SECONDS)} 阻塞 2 秒——由于锁内已经不含 AI 调用（见
+     * {@link #tickSafe()}），实际竞争窗口是毫秒级的，等 500ms 足够，等不到就说明真有人在做长操作。
+     */
+    private boolean acquireTickLock() throws InterruptedException {
+        long deadline = System.currentTimeMillis() + LOCK_WAIT_MILLIS;
+        do {
+            if (tickLock.tryLock(LOCK_RETRY_MILLIS, TimeUnit.MILLISECONDS)) {
+                return true;
+            }
+        } while (System.currentTimeMillis() < deadline);
+        return false;
+    }
+
     private double food;
     private double resources;
     /** 当年粮食总产出，用于计算净收支。 */
@@ -222,10 +258,16 @@ public class EvolutionEngine {
         this.narrateEnabled = enabled;
     }
 
-    /** 推进一年（线程安全）。拿不到锁直接跳过。 */
+    /**
+     * 推进一年（线程安全）。500ms 内拿不到锁就直接跳过这一轮。
+     *
+     * <p>锁只覆盖计算与状态落地：这一年的 AI 请求在 {@link #aiTick()} 里只做「拼 prompt + 提交异步任务」，
+     * 真正的网络调用跑在 {@code narrativeExecutor} 线程上、不持锁；AI 结果下一轮由
+     * {@link #applyPendingAiReplies()} 在持锁状态下落地。所以 tick 绝不会因为 AI 慢而压住锁。
+     */
     public boolean tickSafe() {
         try {
-            if (!tickLock.tryLock(2, TimeUnit.SECONDS)) {
+            if (!acquireTickLock()) {
                 return false;
             }
             try {
@@ -242,11 +284,13 @@ public class EvolutionEngine {
 
     /** 推进一年（内部实现，不含加锁）。 */
     private void tickImpl() {
-        if (gameOver) {
-            return;
-        }
         if (world.getYear() >= GAME_MAX_YEAR) {
             setGameOver("你的国家活到了第 " + GAME_MAX_YEAR + " 年");
+            return;
+        }
+        // 终局复查：上次若是「玩家控制的文明全灭」判的终局，玩家可能已切换到别的存活文明 → 这里可恢复
+        checkPlayerExtinction(world.getYear());
+        if (gameOver) {
             return;
         }
         // 已结束（到 1000 年上限或玩家已灭亡）：世界不再推进
@@ -291,7 +335,7 @@ public class EvolutionEngine {
         checkEraPromotion();
         // AI 主动外交：每年独立掷骰，随机触发（不是固定周期）
         checkDiplomacy(world.getYear());
-        // 玩家（id=1）灭亡即终局
+        // 终局判定：玩家当前控制的文明全灭才结束
         checkPlayerExtinction(world.getYear());
     }
 
@@ -300,26 +344,100 @@ public class EvolutionEngine {
         tickSafe();
     }
 
-    /** 终局判定：玩家文明不存在或已灭亡，就把整局判为结束（只在第一次触发时记录原因）。 */
+    /**
+     * 终局判定：按「玩家当前控制的文明」判定，不再写死 id=1。
+     * 只要还有任意一个被玩家控制的文明活着，游戏就继续；全部已灭亡才算终局。
+     *
+     * <ul>
+     *   <li>多玩家：某个玩家的文明灭了，但别的玩家还活着 → 不结束；</li>
+     *   <li>切换文明：判定依据是「当前控制的文明」，切过去的文明还活着就不会触发终局；</li>
+     *   <li>玩家控制的 id 还没有对应文明（刚加入、该 id 尚未诞生）→ 不算灭亡，不触发终局；</li>
+     *   <li>没有在线玩家（离线测试 / 全员离线）→ 退回旧口径，只看文明 id=1。</li>
+     * </ul>
+     *
+     * <p>本方法按当前状态重新求值，不是一次性闩锁：若先前因全灭判过终局，
+     * 之后玩家切换/接入了一个存活文明，这里会撤销终局、世界继续演化。
+     */
     private void checkPlayerExtinction(int year) {
         if (world.getCivilizations().isEmpty()) {
             return;   // 空世界不判定（等新游戏生成玩家）
         }
-        Civilization player = world.findCivilization(PLAYER_CIV_ID);
-        if (player == null || player.getPopulation() <= 0) {
-            int founded = player == null ? 0 : player.getFoundedYear();
-            setGameOver("你的国家在 Y" + year + " 年灭亡，存活了 " + Math.max(0, year - founded) + " 年");
+        Civilization firstExisting = null;
+        boolean anyAlive = false;
+        for (long civId : controlledCivIds()) {
+            Civilization civilization = world.findCivilization(civId);
+            if (civilization == null) {
+                continue;   // 该 id 的文明还没诞生：视作待观察，不算灭亡
+            }
+            if (firstExisting == null) {
+                firstExisting = civilization;
+            }
+            if (civilization.getPopulation() > 0) {
+                anyAlive = true;
+                break;
+            }
         }
+        if (anyAlive) {
+            // 还有玩家控制的文明活着：撤销「因全灭」判下的终局，游戏继续
+            clearExtinctionGameOver();
+            return;
+        }
+        if (firstExisting != null) {
+            int founded = firstExisting.getFoundedYear();
+            setGameOver("你的国家在 Y" + year + " 年灭亡，存活了 " + Math.max(0, year - founded) + " 年", true);
+        }
+    }
+
+    /**
+     * 当前被玩家控制的文明 id：优先取在线玩家所控制的；没有在线玩家时退回 id=1（兼容离线 / 单人）。
+     */
+    private List<Long> controlledCivIds() {
+        if (playerService == null) {
+            return List.of(PLAYER_CIV_ID);
+        }
+        List<Integer> online = playerService.controlledCivIds();
+        if (online.isEmpty()) {
+            return List.of(PLAYER_CIV_ID);
+        }
+        List<Long> ids = new ArrayList<>();
+        for (Integer id : online) {
+            if (id != null && id > 0) {
+                ids.add(id.longValue());
+            }
+        }
+        return ids.isEmpty() ? List.of(PLAYER_CIV_ID) : ids;
     }
 
     /** 标记终局：gameOver 置位、记下原因，并写一条终局事件。 */
     private void setGameOver(String reason) {
+        setGameOver(reason, false);
+    }
+
+    /**
+     * 标记终局。
+     *
+     * @param byExtinction 是否由「玩家控制的文明全灭」造成（决定后续能否被撤销）
+     */
+    private void setGameOver(String reason, boolean byExtinction) {
         if (gameOver) {
             return;
         }
         gameOver = true;
         gameOverReason = reason;
+        gameOverByExtinction = byExtinction;
         record(world.getYear(), EventType.AI_EVENT, "【终局】" + reason, 100);
+    }
+
+    /** 撤销「因玩家文明全灭」判下的终局（玩家重新掌握了一个存活文明）。 */
+    private void clearExtinctionGameOver() {
+        if (!gameOver || !gameOverByExtinction) {
+            return;
+        }
+        gameOver = false;
+        gameOverReason = null;
+        gameOverByExtinction = false;
+        record(world.getYear(), EventType.AI_EVENT,
+                "【终局撤销】玩家重新掌握了一个存活的文明，世界继续演化。", 100);
     }
 
     // ==================== 终局状态（对外 / 存档） ====================
@@ -334,10 +452,14 @@ public class EvolutionEngine {
         return gameOverReason;
     }
 
-    /** 恢复存档用：写回终局状态。 */
+    /**
+     * 恢复存档用：写回终局状态。存档里分不清终局原因，按「可能是全灭终局」处理——
+     * 若是 1000 年上限的终局，年份判断会在 tick 开头先拦下，不会被误撤销。
+     */
     public void restoreGameOver(boolean over, String reason) {
         this.gameOver = over;
         this.gameOverReason = reason;
+        this.gameOverByExtinction = over;
     }
 
     /**
@@ -2487,8 +2609,8 @@ public class EvolutionEngine {
      */
     public String skipEra(int targetEraIndex) {
         try {
-            if (!tickLock.tryLock(2, TimeUnit.SECONDS)) {
-                return "世界正在被其他玩家操作，请稍后重试";
+            if (!acquireTickLock()) {
+                return BUSY_MESSAGE;
             }
             try {
                 return skipEraImpl(targetEraIndex);
@@ -2567,8 +2689,8 @@ public class EvolutionEngine {
      */
     public String resetWorld() {
         try {
-            if (!tickLock.tryLock(2, TimeUnit.SECONDS)) {
-                return "世界正在被其他玩家操作，请稍后重试";
+            if (!acquireTickLock()) {
+                return BUSY_MESSAGE;
             }
             try {
                 return resetWorldImpl();
@@ -2676,7 +2798,7 @@ public class EvolutionEngine {
      */
     public String newGameWithEra(String key) {
         try {
-            if (!tickLock.tryLock(2, TimeUnit.SECONDS)) {
+            if (!acquireTickLock()) {
                 return null;  // 返回 null 表示加锁失败
             }
             try {
